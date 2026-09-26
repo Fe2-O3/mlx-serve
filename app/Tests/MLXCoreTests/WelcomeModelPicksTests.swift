@@ -10,20 +10,33 @@ final class WelcomeModelPicksTests: XCTestCase {
         SystemMemoryInfo(totalBytes: total * gib, usableBytes: usable * gib)
     }
 
-    func testTwentyFourGBMacGetsGemma12BAndQwen9B() {
+    func testTwentyFourGBMacGetsGemma12BAndMimo9B() {
         let picks = WelcomeModelPicks.forMemory(mac(total: 24, usable: 16))
-        // General → Gemma 4 12B (26B-A4B needs ~17 GB, exceeds 16 usable).
+        // General → Gemma 4 12B (Muse needs ~25.7 GB, exceeds 16 usable).
         XCTAssertEqual(picks.first { $0.category == "General" }?.pick.id, "gemma-4-12b")
-        // Coding & agents → Qwen 9B (27B needs ~18 GB, exceeds).
-        XCTAssertEqual(picks.first { $0.category == "Coding & agents" }?.pick.id, "qwen35-9b")
+        // Coding & agents → MiMo distill 9B (27B needs ~21.8 GB, exceeds).
+        XCTAssertEqual(picks.first { $0.category == "Coding & agents" }?.pick.id, "mimo-distill-9b")
         XCTAssertEqual(picks.count, 2)
     }
 
     func testLargeMacGetsTheBiggestOfEachType() {
         let picks = WelcomeModelPicks.forMemory(mac(total: 256, usable: 200))
-        XCTAssertEqual(picks.first { $0.category == "General" }?.pick.id, "gemma-4-26b-a4b-8bit")
-        XCTAssertEqual(picks.first { $0.category == "Coding & agents" }?.pick.id, "qwen36-35b-a3b")
+        XCTAssertEqual(picks.first { $0.category == "General" }?.pick.id, "muse-glimmer-30b")
+        XCTAssertEqual(picks.first { $0.category == "Coding & agents" }?.pick.id, "qwen38-27b")
         XCTAssertNil(picks.first { $0.pick.id == "qwen38-flash-next" }, "Largest is a browser-only tier, not a welcome category")
+        XCTAssertNil(picks.first { $0.pick.id == "gemma-4-26b-a4b-8bit" }, "the 8-bit build is browser-only")
+        XCTAssertNil(picks.first { $0.pick.id == "qwen36-35b-a3b" }, "the 3.6 MoE is browser-only")
+        XCTAssertEqual(picks.count, 2)
+    }
+
+    /// A 32 GB Mac (usable ~27): Gemma 4 31B and Qwen 3.8 27B are the
+    /// biggest COMFORTABLE fits. Muse would land as a tight fit there, and
+    /// the welcome leads with comfort — a tight fit is what fails under real
+    /// memory pressure.
+    func testThirtyTwoGBMacGetsGemma31BAndQwen27B() {
+        let picks = WelcomeModelPicks.forMemory(mac(total: 32, usable: 27))
+        XCTAssertEqual(picks.first { $0.category == "General" }?.pick.id, "gemma-4-31b")
+        XCTAssertEqual(picks.first { $0.category == "Coding & agents" }?.pick.id, "qwen38-27b")
         XCTAssertEqual(picks.count, 2)
     }
 

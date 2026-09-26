@@ -1,7 +1,7 @@
 import XCTest
 @testable import MLXCore
 
-/// Pins the "Recommended" pane's data: three sections (Gemma 4, Qwen,
+/// Pins the "Recommended" pane's data: four sections (Gemma 4, Qwen, Muse,
 /// Largest), each ascending by size, plus the RAM-requirements math that
 /// drives the pane's dim-but-never-hide treatment. The pane exists to answer
 /// "which model should I download" for someone with zero AI experience, so
@@ -11,28 +11,29 @@ final class RecommendedModelsTests: XCTestCase {
 
     private let GiB: UInt64 = 1_073_741_824
 
-    /// Every recommended pick across all three sections — the union the
+    /// Every recommended pick across all four sections — the union the
     /// invariant tests below sweep, so a new section can't slip past them.
     private var allRecommended: [RecommendedModelPick] {
         RecommendedModelPick.allCatalogs
     }
 
     /// `allCatalogs` is what the invariant sweeps run over, so it has to BE the
-    /// three sections — a section left out of it is a section with no guards.
-    func testAllCatalogsIsTheUnionOfTheThreeSections() {
+    /// four sections — a section left out of it is a section with no guards.
+    func testAllCatalogsIsTheUnionOfTheFourSections() {
         let union = RecommendedModelPick.gemmaCatalog
             + RecommendedModelPick.qwenCatalog
+            + RecommendedModelPick.museCatalog
             + RecommendedModelPick.largestCatalog
         XCTAssertEqual(RecommendedModelPick.allCatalogs, union)
     }
 
     // MARK: - Catalog shape
 
-    /// The pane's whole layout assumes exactly three sections
-    /// (Gemma 4, Qwen, Largest).
-    func testExactlyThreeFamiliesArePresent() {
+    /// The pane's whole layout assumes exactly four sections
+    /// (Gemma 4, Qwen, Muse, Largest).
+    func testExactlyFourFamiliesArePresent() {
         let families = Set(allRecommended.map(\.family))
-        XCTAssertEqual(families, [.gemma, .qwen, .largest])
+        XCTAssertEqual(families, [.gemma, .qwen, .muse, .largest])
     }
 
     /// A family catalog can't be empty — a section with zero rows would be a
@@ -40,17 +41,22 @@ final class RecommendedModelsTests: XCTestCase {
     func testNoFamilyCatalogIsEmpty() {
         XCTAssertFalse(RecommendedModelPick.gemmaCatalog.isEmpty)
         XCTAssertFalse(RecommendedModelPick.qwenCatalog.isEmpty)
+        XCTAssertFalse(RecommendedModelPick.museCatalog.isEmpty)
         XCTAssertFalse(RecommendedModelPick.largestCatalog.isEmpty)
     }
 
-    /// Every entry in `gemmaCatalog` is actually Gemma, and every entry in
-    /// `qwenCatalog` is actually Qwen — the section header promises this.
+    /// Every entry in `gemmaCatalog` is actually Gemma, every entry in
+    /// `qwenCatalog` is actually Qwen, every entry in `museCatalog` is Muse —
+    /// the section header promises this.
     func testEveryEntryMatchesItsCatalogsFamily() {
         for p in RecommendedModelPick.gemmaCatalog {
             XCTAssertEqual(p.family, .gemma, p.id)
         }
         for p in RecommendedModelPick.qwenCatalog {
             XCTAssertEqual(p.family, .qwen, p.id)
+        }
+        for p in RecommendedModelPick.museCatalog {
+            XCTAssertEqual(p.family, .muse, p.id)
         }
         for p in RecommendedModelPick.largestCatalog {
             XCTAssertEqual(p.family, .largest, p.id)
@@ -64,6 +70,8 @@ final class RecommendedModelsTests: XCTestCase {
         XCTAssertEqual(gemmaSizes, gemmaSizes.sorted())
         let qwenSizes = RecommendedModelPick.qwenCatalog.map(\.sizeGB)
         XCTAssertEqual(qwenSizes, qwenSizes.sorted())
+        let museSizes = RecommendedModelPick.museCatalog.map(\.sizeGB)
+        XCTAssertEqual(museSizes, museSizes.sorted())
         let largestSizes = RecommendedModelPick.largestCatalog.map(\.sizeGB)
         XCTAssertEqual(largestSizes, largestSizes.sorted())
     }
@@ -131,13 +139,19 @@ final class RecommendedModelsTests: XCTestCase {
 
     /// The MTP-scored picks are the ones whose checkpoint ships a draft head
     /// this app runs by default, scored from the bench's `mtp` cells: the
-    /// 35B-A3B is the fastest thing here, Flash-Next sits above the 27B.
+    /// 35B-A3B is the fastest thing here, Flash-Next sits above the 27B, and
+    /// the two ddalcu packs with bundled draft heads score at their rates.
     func testMtpScoredPicksAreTheOnesShippingADraftHead() {
         let mtp = Set(allRecommended.filter(\.speedIsWithMtp).map(\.id))
-        XCTAssertEqual(mtp, ["qwen38-27b", "bonsai2-27b", "qwen36-35b-a3b", "qwen38-flash-next"])
+        XCTAssertEqual(mtp, ["qwen38-27b", "bonsai2-27b", "qwen36-35b-a3b", "qwen38-flash-next",
+                             "mimo-distill-9b", "muse-glimmer-30b"])
         XCTAssertEqual(RecommendedModelPick.qwen36_35bA3b.speed, allRecommended.map(\.speed).max())
         XCTAssertGreaterThan(RecommendedModelPick.qwen38FlashNext.speed, RecommendedModelPick.qwen38_27b.speed)
         XCTAssertLessThan(RecommendedModelPick.qwen38FlashNext.speed, RecommendedModelPick.qwen36_35bA3b.speed)
+        // The distill outruns the plain 9B it sits beside — same trunk size,
+        // grafted draft head.
+        XCTAssertGreaterThan(RecommendedModelPick.mimoDistill9B.speed,
+                             RecommendedModelPick.qwen35_9b.speed)
     }
 
     /// The same weights quantized twice are the same model: an 8-bit build is
@@ -173,7 +187,8 @@ final class RecommendedModelsTests: XCTestCase {
     /// point of carrying the flag.
     func testOnlyTheModelsAbsentFromTheIndexAreFlaggedEstimated() {
         let estimated = Set(allRecommended.filter(\.intelligenceIsEstimated).map(\.id))
-        XCTAssertEqual(estimated, ["qwen38-27b", "bonsai2-27b", "qwen38-flash-next"])
+        XCTAssertEqual(estimated, ["qwen38-27b", "bonsai2-27b", "qwen38-flash-next",
+                                   "mimo-distill-9b", "muse-glimmer-30b"])
     }
 
     /// The bar fractions the pane draws stay inside the track, and context —
@@ -200,6 +215,8 @@ final class RecommendedModelsTests: XCTestCase {
         XCTAssertEqual(RecommendedModelPick.qwen38_27b.contextTokens, 262_144)
         XCTAssertEqual(RecommendedModelPick.qwen38FlashNext.contextTokens, 262_144)
         XCTAssertEqual(RecommendedModelPick.deepseekV4Flash.contextTokens, 1_048_576)
+        XCTAssertEqual(RecommendedModelPick.museGlimmer30B.contextTokens, 131_072)
+        XCTAssertEqual(RecommendedModelPick.mimoDistill9B.contextTokens, 262_144)
     }
 
     /// `activeParamsB` is a fact per checkpoint, not a restatement of the
@@ -209,6 +226,8 @@ final class RecommendedModelsTests: XCTestCase {
         XCTAssertEqual(RecommendedModelPick.qwen38FlashNext.activeParamsB, 6.0) // 125B total
         XCTAssertEqual(RecommendedModelPick.deepseekV4Flash.activeParamsB, 13.0) // 284B total
         XCTAssertEqual(RecommendedModelPick.gemma31B.activeParamsB, 31.0)      // dense
+        XCTAssertEqual(RecommendedModelPick.mimoDistill9B.activeParamsB, 9.0)  // dense
+        XCTAssertEqual(RecommendedModelPick.museGlimmer30B.activeParamsB, 30.0) // dense
     }
 
     // MARK: - Starter recommendation (RAM tiers)
@@ -410,6 +429,53 @@ final class RecommendedModelsTests: XCTestCase {
         let repoIds = RecommendedModelPick.qwenCatalog.map(\.repoId)
         XCTAssertTrue(repoIds.contains("mlx-community/Qwen3.5-9B-MLX-4bit"))
         XCTAssertFalse(repoIds.contains { $0.contains("0.8B") })
+    }
+
+    /// The two ddalcu packs: Muse-Glimmer 30B opens its own family section,
+    /// MiMo distill joins Qwen. Both bundle a draft head the server runs by
+    /// default on dense checkpoints, so both score speed WITH it; both
+    /// intelligence scores are estimates (no index entry as of the file
+    /// header's date). Muse keeps the plain weights×1.2 RAM gate — the
+    /// README sizes it for 32 GB, so a 24 GB Mac must read won't-fit.
+    func testTheTwoNewDdalcuPicksArePinned() {
+        let muse = RecommendedModelPick.museGlimmer30B
+        XCTAssertEqual(muse.id, "muse-glimmer-30b")
+        XCTAssertEqual(muse.repoId, "ddalcu/Muse-Glimmer-30B-MLX-Serve-4bit")
+        XCTAssertEqual(muse.family, .muse)
+        XCTAssertEqual(muse.sizeGB, 21.4, accuracy: 0.01)
+        XCTAssertEqual(muse.approxRAMNeededGB, 25.68, accuracy: 0.01)
+        XCTAssertNil(muse.ramOverrideGB)
+        XCTAssertEqual(muse.speed, 33)
+        XCTAssertTrue(muse.speedIsWithMtp)
+        XCTAssertEqual(muse.contextTokens, 131_072)
+        XCTAssertEqual(muse.activeParamsB, 30.0)
+        XCTAssertEqual(muse.quantLabel, "4-bit")
+        XCTAssertTrue(muse.intelligenceIsEstimated)
+        XCTAssertFalse(muse.meetsSystemRequirements(physicalMemoryBytes: 24 * GiB))
+        XCTAssertTrue(muse.meetsSystemRequirements(physicalMemoryBytes: 32 * GiB))
+
+        let mimo = RecommendedModelPick.mimoDistill9B
+        XCTAssertEqual(mimo.id, "mimo-distill-9b")
+        XCTAssertEqual(mimo.repoId, "ddalcu/MiMo-V2.6-Distill-Qwen-9B-MLX-Serve-4bit")
+        XCTAssertEqual(mimo.family, .qwen)
+        XCTAssertEqual(mimo.sizeGB, 7.6, accuracy: 0.01)
+        XCTAssertEqual(mimo.speed, 60)
+        XCTAssertTrue(mimo.speedIsWithMtp)
+        XCTAssertEqual(mimo.contextTokens, 262_144)
+        XCTAssertEqual(mimo.activeParamsB, 9.0)
+        XCTAssertEqual(mimo.quantLabel, "4-bit")
+        XCTAssertTrue(mimo.intelligenceIsEstimated)
+        XCTAssertTrue(mimo.meetsSystemRequirements(physicalMemoryBytes: 16 * GiB))
+    }
+
+    /// The blurbs claim only what the server actually serves: Muse-Glimmer's
+    /// image input is NOT served yet (its README says so), so its blurb must
+    /// not promise pictures; MiMo's image input works and its blurb says so.
+    func testBlurbsClaimOnlyWhatTheServerServes() {
+        XCTAssertFalse(RecommendedModelPick.museGlimmer30B.blurb.lowercased().contains("image"),
+                       "Muse does not serve image input yet")
+        XCTAssertTrue(RecommendedModelPick.mimoDistill9B.blurb.lowercased().contains("image"),
+                      "MiMo serves image input, and the blurb should say so")
     }
 
     /// The Recommended table names the quant beside the size so nobody finds

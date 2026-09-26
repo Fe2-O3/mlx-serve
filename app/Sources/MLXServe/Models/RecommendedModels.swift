@@ -2,8 +2,8 @@ import Foundation
 
 private let bytesPerGiB: Double = 1_073_741_824
 
-/// Data behind the Model Browser's "Recommended" pane: the Gemma 4 and
-/// Qwen checkpoints this app is tuned hardest for (native MTP
+/// Data behind the Model Browser's "Recommended" pane: the Gemma 4, Qwen
+/// and Muse checkpoints this app is tuned hardest for (native MTP
 /// speculative decode, PLD, the assistant-drafter catalog all target these),
 /// grouped by family and explained in plain English for someone who has
 /// never picked a local model before. It intentionally does NOT reuse
@@ -47,22 +47,26 @@ private let bytesPerGiB: Double = 1_073_741_824
 /// runs by default (`speedIsWithMtp`) scores the bench's `mtp` cell instead:
 /// that IS the rate the user gets, and scoring it serial would rank the
 /// fastest model here behind Gemma E2B. Opt-in speculation (DSpark, PLD, the
-/// assistant drafter) stays excluded. `activeParamsB` exists so the plain
-/// scores can be CHECKED rather than trusted — see the ordering invariant in
-/// `RecommendedModelsTests`; MTP-scored picks are swept separately there.
+/// separately-downloaded assistant drafter) stays excluded; a draft head the
+/// REPO bundles and this app enables by default (MiMo's MTP sidecar, Muse's
+/// `drafter/` folder) counts as built-in and scores with its model.
+/// `activeParamsB` exists so the plain scores can be CHECKED rather than
+/// trusted — see the ordering invariant in `RecommendedModelsTests`;
+/// MTP-scored picks are swept separately there.
 ///
 /// **Context** is the checkpoint's own `max_position_embeddings`, read from
 /// each repo's `config.json`. It is deliberately NOT the RAM-clamped effective
 /// window: the bars compare models to each other, and the clamp is a property
 /// of the user's Mac.
 
-/// Which curated section a pick belongs to. Gemma/Qwen are vendor families;
-/// `largest` is a RAM tier — the biggest models this app runs (Qwen 3.8
-/// Flash-Next, DeepSeek-V4-Flash on the native MLX arch), grouped by "needs a
-/// very large Mac" rather than vendor.
+/// Which curated section a pick belongs to. Gemma/Qwen/Muse are vendor
+/// families; `largest` is a RAM tier — the biggest models this app runs
+/// (Qwen 3.8 Flash-Next, DeepSeek-V4-Flash on the native MLX arch),
+/// grouped by "needs a very large Mac" rather than vendor.
 enum RecommendedModelFamily: String {
     case gemma = "Gemma"
     case qwen = "Qwen"
+    case muse = "Muse"
     case largest = "Largest models"
 }
 
@@ -255,6 +259,34 @@ extension RecommendedModelPick {
         activeParamsB: 4.0
     )
 
+    /// Xiaomi's MiMo V2.6 distilled to 9B on a Qwen3.5 trunk (arch
+    /// `qwen3_5`, hence the Qwen section): the entry-level Qwen pick's
+    /// faster sibling. The repo grafts an MTP head from the base
+    /// Qwen3.5-9B checkpoint (`model-mtp.safetensors` sidecar), which the
+    /// server runs by default on a dense target, so `speed` scores THAT
+    /// rate: the README measures 2.3× on predictable text (llmprobe), ~52
+    /// plain tok/s × 2.3 ≈ 120 → 60. Not a bench.sh cell — provenance is
+    /// the README claim, flagged here because no cell exists.
+    ///
+    /// `intelligence` is ESTIMATED (no index entry), placed above the
+    /// measured Qwen3.5-9B it distills from. Image input works
+    /// (README-tested), unlike Muse, so the blurb says it reads pictures.
+    static let mimoDistill9B = RecommendedModelPick(
+        id: "mimo-distill-9b",
+        name: "MiMo V2.6 Distill (9B)",
+        tagline: "Fast small coder",
+        blurb: "A speedy 9B distilled from Xiaomi's flagship MiMo model onto a Qwen trunk — quick replies thanks to a built-in draft head that guesses several words ahead, strong at coding and at using tools, and it reads images too. About 7.6 GB on disk, so it runs comfortably on a 16 GB Mac, and it feels much faster than the plain Qwen 9B beside it.",
+        repoId: "ddalcu/MiMo-V2.6-Distill-Qwen-9B-MLX-Serve-4bit",
+        sizeGB: 7.6,
+        family: .qwen,
+        intelligence: 40,
+        intelligenceIsEstimated: true,
+        speed: 60,
+        speedIsWithMtp: true,
+        contextTokens: 262_144,
+        activeParamsB: 9.0
+    )
+
     /// Qwen 3.5 9B — the entry-level Qwen pick. Replaces the earlier 0.8B
     /// entry, which was too small to be a meaningful comparison against the
     /// Gemma lineup.
@@ -403,19 +435,53 @@ extension RecommendedModelPick {
         ramOverrideGB: 78.0
     )
 
+    /// Muse-Glimmer 30B — Meta's dense checkpoint (arch `muse_glimmer`),
+    /// alone in its own family section. The repo bundles its DFlash drafter
+    /// in `drafter/`, which the server enables by default for a dense
+    /// target, so `speed` is the README's drafter-on rate (~65 tok/s mean
+    /// over its three M4 Max cells → 33), not plain decode. No bench.sh
+    /// cell either; provenance is the README table.
+    ///
+    /// `intelligence` is ESTIMATED (no index entry), placed below the
+    /// measured Gemma 4 31B. The pack is multimodal but the server does
+    /// NOT serve image input for it yet (README), so the blurb promises no
+    /// pictures. No `ramOverrideGB`: weights×1.2 = 25.7 GB matches the
+    /// README's "about 24 GB" / "32 GB machine" guidance closely enough
+    /// that the honest gate is the plain formula.
+    static let museGlimmer30B = RecommendedModelPick(
+        id: "muse-glimmer-30b",
+        name: "Muse-Glimmer 30B",
+        tagline: "Meta's all-rounder",
+        blurb: "Meta's all-rounder — excellent at everyday chat, writing, reasoning and long documents, and one of the smartest models that fits a 32 GB Mac. It bundles a small companion model that drafts words ahead to keep replies quick, and at about 21 GB on disk it is a far lighter download than the giants in the Largest section.",
+        repoId: "ddalcu/Muse-Glimmer-30B-MLX-Serve-4bit",
+        sizeGB: 21.4,
+        family: .muse,
+        intelligence: 45,
+        intelligenceIsEstimated: true,
+        speed: 33,
+        speedIsWithMtp: true,
+        contextTokens: 131_072,
+        activeParamsB: 30.0
+    )
+
 }
 
 extension RecommendedModelPick {
-    /// Gemma 4 picks, ascending by size — one of the Recommended pane's two
+    /// Gemma 4 picks, ascending by size — one of the Recommended pane's
     /// family sections.
     static let gemmaCatalog: [RecommendedModelPick] = [
         .gemmaE4B, .gemma12B, .gemma26bA4b, .gemma31B, .gemma26bA4b8bit,
     ]
 
-    /// Qwen picks, ascending by size — the Recommended pane's other family
-    /// section.
+    /// Qwen picks, ascending by size — the Recommended pane's Qwen section
+    /// (Qwen-architecture checkpoints, including Xiaomi's MiMo distill).
     static let qwenCatalog: [RecommendedModelPick] = [
-        .qwen35_9b, .bonsai2_27b, .qwen38_27b, .qwen36_35bA3b,
+        .qwen35_9b, .mimoDistill9B, .bonsai2_27b, .qwen38_27b, .qwen36_35bA3b,
+    ]
+
+    /// Muse picks — the Recommended pane's Muse section (one entry today).
+    static let museCatalog: [RecommendedModelPick] = [
+        .museGlimmer30B,
     ]
 
     /// The largest models this app runs, ascending by on-disk size (the app's
@@ -426,10 +492,10 @@ extension RecommendedModelPick {
         .qwen38FlashNext, .deepseekV4Flash,
     ]
 
-    /// Every curated pick, across all three sections — the union the score
+    /// Every curated pick, across all four sections — the union the score
     /// invariants sweep and the one list a new section can't slip past.
     static let allCatalogs: [RecommendedModelPick] =
-        gemmaCatalog + qwenCatalog + largestCatalog
+        gemmaCatalog + qwenCatalog + museCatalog + largestCatalog
 
     // MARK: - The starter recommendation
 

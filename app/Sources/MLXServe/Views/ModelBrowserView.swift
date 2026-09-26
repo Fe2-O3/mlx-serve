@@ -145,7 +145,7 @@ private struct ModelBrowserSectionBar: View {
 
 // MARK: - Recommended
 
-/// Every curated Gemma 4 / Qwen 3.5-3.6 checkpoint, grouped by family and
+/// Every curated Gemma 4 / Qwen / Muse checkpoint, grouped by family and
 /// explained in plain English. This is the friendly front door for someone
 /// who has never picked a local model before — Discover's HuggingFace search
 /// (with its 1M+ repos, quant/pull-count columns, and RAM-fitness dots)
@@ -154,7 +154,7 @@ private struct RecommendedPane: View {
     /// Everything below the one recommendation. Collapsed by default: picking a
     /// model used to mean choosing a vendor taxonomy before you could chat, and
     /// the answer for someone who has downloaded nothing is one model, not
-    /// fourteen across four sections.
+    /// thirteen across four sections.
     private var memory: SystemMemoryInfo { SystemMemoryInfo.current() }
     private var starter: RecommendedModelPick {
         RecommendedModelPick.starterPick(physicalMemoryBytes: memory.totalBytes)
@@ -251,6 +251,8 @@ private struct RecommendedModelTable: View {
                    picks: RecommendedModelPick.gemmaCatalog),
             Family(id: "qwen", title: "Qwen", systemImage: "q.circle", tint: .teal,
                    picks: RecommendedModelPick.qwenCatalog),
+            Family(id: "muse", title: "Muse", systemImage: "m.circle", tint: .orange,
+                   picks: RecommendedModelPick.museCatalog),
             Family(id: "largest", title: "Largest models", systemImage: "memorychip", tint: .red,
                    picks: RecommendedModelPick.largestCatalog),
         ]

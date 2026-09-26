@@ -20,20 +20,22 @@ enum WelcomeModelPicks {
         let catalog: [RecommendedModelPick]
     }
 
-    /// Types the welcome screen offers, in order. Strengths are family-level
-    /// (every Gemma is a good all-rounder; every Qwen is a coder), kept to one
-    /// short sentence deliberately. The "largest models" tier is intentionally
-    /// absent — it's a niche that only fits very large Macs and the browser
-    /// covers it.
+    /// Types the welcome screen offers, in order: General spans the Gemma
+    /// section plus Muse (minus the 8-bit build); Coding spans Qwen minus
+    /// the entries the welcome deliberately leads without (the 2-bit Bonsai
+    /// squeeze and the 3.6 MoE stay browser-only). Strengths are
+    /// family-level (every Gemma is a good all-rounder; every Qwen is a
+    /// coder), kept to one short sentence deliberately. The "largest
+    /// models" tier is intentionally absent — it's a niche that only fits
+    /// very large Macs and the browser covers it.
     private static let categories: [Category] = [
         Category(label: "General",
                  strength: "Best all-rounder for everyday chat, writing, and quick questions.",
-                 catalog: RecommendedModelPick.gemmaCatalog),
-        // Bonsai is listed in the browser only: first-run surfaces keep the
-        // faster plain-quant picks.
+                 catalog: RecommendedModelPick.gemmaCatalog.filter { $0 != .gemma26bA4b8bit }
+                    + RecommendedModelPick.museCatalog),
         Category(label: "Coding & agents",
                  strength: "Strong at coding and multi-step agent work like using tools.",
-                 catalog: RecommendedModelPick.qwenCatalog.filter { $0 != .bonsai2_27b }),
+                 catalog: RecommendedModelPick.qwenCatalog.filter { $0 != .bonsai2_27b && $0 != .qwen36_35bA3b }),
     ]
 
     /// The best model of each type for this Mac's usable memory, with its
