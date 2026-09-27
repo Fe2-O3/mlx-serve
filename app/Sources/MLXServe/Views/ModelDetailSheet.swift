@@ -26,14 +26,6 @@ struct ModelDetailSheet: View {
                         .textSelection(.enabled)
                 }
                 Spacer()
-                if let url = TierListLinks.url(repoId: request.repoId) {
-                    Button {
-                        NSWorkspace.shared.open(url)
-                    } label: {
-                        Label("Tier list entry", systemImage: "list.number")
-                    }
-                    .help("See how this model ranks on the community tier list")
-                }
                 if let url = ModelCard.pageURL(repoId: request.repoId) {
                     Button {
                         NSWorkspace.shared.open(url)

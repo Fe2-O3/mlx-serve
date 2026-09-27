@@ -350,6 +350,14 @@
     .vote-btn:hover { border-color: var(--text-secondary); color: var(--text-primary); }
     .vote-btn.vote-up.mine { background: #e4f8ea; border-color: #30d158; color: #0e8a4f; }
     .vote-btn.vote-down.mine { background: #ffe9e7; border-color: #ff6961; color: #c22e26; }
+    .run-btn {
+      font: inherit; font-size: 12px; font-weight: 600; cursor: pointer;
+      display: inline-flex; align-items: center; gap: 5px;
+      padding: 4px 10px; border-radius: 7px; border: 1px solid var(--border);
+      background: var(--bg-alt); color: var(--text-secondary);
+      transition: all 0.12s ease;
+    }
+    .run-btn:hover { border-color: var(--accent); color: var(--text-primary); }
 
     /* ─── compact header (hero removed: board stays above the fold) ─── */
     .page-head { padding: 26px 0 18px; }
@@ -425,7 +433,7 @@
       #unranked-table th:nth-child(6), #unranked-table td:nth-child(6) { display: none; }
       #unranked-table th, #unranked-table td { padding: 8px 6px; }
       #unranked-table td:nth-child(1) { white-space: normal; overflow-wrap: anywhere; }
-      #unranked-table .vote-btn { padding: 4px 7px; font-size: 11px; gap: 3px; }
+      #unranked-table .vote-btn, #unranked-table .run-btn { padding: 4px 7px; font-size: 11px; gap: 3px; }
     }
   </style>
 </head>
@@ -1436,6 +1444,30 @@
   const APP_PICKS = new Set(["gemma-4-e4b", "gemma-4-12b", "gemma-4-26b-a4b",
     "gemma-4-31b", "mimo-v2.6-9b", "qwen3.8-27b", "ternary-bonsai-2-27b",
     "qwen3.6-35b-a3b", "qwen3.8-flash-next", "deepseek-v4-flash"]);
+  // The repo each app-shipped row's Run button copies (`mlx-serve run
+  // <repo>` — the same command the page's own download band advertises).
+  // Same list as APP_PICKS; RecommendedModels.swift is the source of truth.
+  const RUN_REPO = {
+    "gemma-4-e4b": "mlx-community/gemma-4-e4b-it-4bit",
+    "gemma-4-12b": "mlx-community/gemma-4-12b-it-4bit",
+    "gemma-4-26b-a4b": "mlx-community/gemma-4-26b-a4b-it-4bit",
+    "gemma-4-31b": "mlx-community/gemma-4-31b-it-4bit",
+    "mimo-v2.6-9b": "ddalcu/MiMo-V2.6-Distill-Qwen-9B-MLX-Serve-4bit",
+    "qwen3.8-27b": "ddalcu/Qwen3.8-27B-MLX-Serve-4bit",
+    "ternary-bonsai-2-27b": "prism-ml/Ternary-Bonsai-2-27B-mlx-2bit",
+    "qwen3.6-35b-a3b": "ddalcu/Qwen3.6-35B-A3B-MLX-Serve-4bit",
+    "qwen3.8-flash-next": "ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit",
+    "deepseek-v4-flash": "ddalcu/DeepSeek-V4-Flash-0731-iQ-MLX-3.3bpw",
+  };
+  function copyRun(repo) {
+    const cmd = "mlx-serve run " + repo;
+    const done = () => showToast("Copied: " + cmd);
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(cmd).then(done, () => showToast(cmd));
+    } else {
+      showToast(cmd);
+    }
+  }
   function chip(m, t) {
     const el = document.createElement("div");
     el.className = "model-chip";
@@ -1452,10 +1484,13 @@
       '<div class="mc-votes">' +
         '<button class="vote-btn vote-up' + (mine === 1 ? " mine" : "") + '" aria-label="Upvote ' + m.name + '">▲ ' + t.up + "</button>" +
         '<button class="vote-btn vote-down' + (mine === -1 ? " mine" : "") + '" aria-label="Downvote ' + m.name + '">▼ ' + t.down + "</button>" +
+        (RUN_REPO[m.id] ? '<button class="run-btn" aria-label="Copy run command for ' + m.name + '">⧉ Run</button>' : "") +
       "</div>";
     el.querySelector(".mc-name").textContent = m.name;
     el.querySelector(".vote-up").addEventListener("click", () => backend.vote(m.id, mine === 1 ? 0 : 1));
     el.querySelector(".vote-down").addEventListener("click", () => backend.vote(m.id, mine === -1 ? 0 : -1));
+    const runBtn = el.querySelector(".run-btn");
+    if (runBtn) runBtn.addEventListener("click", () => copyRun(RUN_REPO[m.id]));
     return el;
   }
 
@@ -1473,10 +1508,13 @@
         (APP_PICKS.has(m.id) ? '<span class="mc-tag mc-app">In the app</span> ' : "") +
         m.tags.map((x) => '<span class="mc-tag">' + TAG_LABELS[x] + "</span>").join(" ") + "</td>" +
       '<td><button class="vote-btn vote-up' + (mine === 1 ? " mine" : "") + '" aria-label="Upvote ' + m.name + '">▲ ' + t.up + "</button> " +
-        '<button class="vote-btn vote-down' + (mine === -1 ? " mine" : "") + '" aria-label="Downvote ' + m.name + '">▼ ' + t.down + "</button></td>";
+        '<button class="vote-btn vote-down' + (mine === -1 ? " mine" : "") + '" aria-label="Downvote ' + m.name + '">▼ ' + t.down + "</button>" +
+        (RUN_REPO[m.id] ? ' <button class="run-btn" aria-label="Copy run command for ' + m.name + '">⧉ Run</button>' : "") + "</td>";
     tr.querySelector(".td-name").textContent = m.name;
     tr.querySelector(".vote-up").addEventListener("click", () => backend.vote(m.id, mine === 1 ? 0 : 1));
     tr.querySelector(".vote-down").addEventListener("click", () => backend.vote(m.id, mine === -1 ? 0 : -1));
+    const runBtn = tr.querySelector(".run-btn");
+    if (runBtn) runBtn.addEventListener("click", () => copyRun(RUN_REPO[m.id]));
     return tr;
   }
 
