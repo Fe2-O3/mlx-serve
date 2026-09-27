@@ -255,32 +255,26 @@ extension RecommendedModelPick {
         activeParamsB: 4.0
     )
 
-    /// Qwen 3.6 27B on ddalcu's MTP pack — the checkpoint with the trained
-    /// draft head as a sidecar (`mtp/weights.safetensors`), which the server
-    /// auto-loads and runs by default on a dense target, so `speed` scores
-    /// the bench's MTP rate. This is the pack the app's own MTP work was
-    /// built against. Repo is tagged text-generation: the blurb claims no
-    /// vision.
+    /// MiMo-V2.6 distilled to 9B on ddalcu's 4-bit pack — the entry-level
+    /// Qwen pick. A dense 9B with a vision tower (the repo is tagged
+    /// image-text-to-text) and a 256K window, small enough for a 16 GB Mac.
     ///
-    /// `intelligence` is the Artificial Analysis score from the same
-    /// 2026-07-30 read — the value `qwen38_27b`'s placement comment already
-    /// references ("one point below"). `speed` is the bench.sh code cells
-    /// (74.3 → 77.3 tok/s, M4 Max, 26.9.x round; no benchmarks.md row yet),
-    /// ~75 tok/s ÷ 2.
-    static let qwen36_27bMtp = RecommendedModelPick(
-        id: "qwen36-27b-mtp",
-        name: "Qwen 3.6 27B",
-        tagline: "Slightly older, a bit lighter",
-        blurb: "An earlier generation of Qwen's 27-billion-parameter model — still excellent at coding, reasoning, and long documents, and a little smaller on disk than the 3.8 beside it. It carries its own built-in speed trick as a small add-on file that the app loads automatically, so it drafts and double-checks several words at once and replies briskly for a model this capable.",
-        repoId: "ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve",
-        sizeGB: 15.5,
+    /// `intelligence` is ESTIMATED: the index has no entry for the distill.
+    /// Placed a notch above the retired Qwen 9B's 35 on the maintainer's
+    /// read. `speed` is the 9B-class rate (no benchmarks.md row yet).
+    static let mimo9b = RecommendedModelPick(
+        id: "mimo-9b",
+        name: "MiMo 9B",
+        tagline: "Small, sharp, and quick",
+        blurb: "A smaller model that punches above its size — good at everyday chat, coding help, and following instructions, and it reads images too. The lightest Qwen here, so it fits Macs with less memory while still replying quickly.",
+        repoId: "ddalcu/MiMo-V2.6-Distill-Qwen-9B-MLX-Serve-4bit",
+        sizeGB: 7.1,
         family: .qwen,
-        intelligence: 62,
-        intelligenceIsEstimated: false,
-        speed: 37,
-        speedIsWithMtp: true,
+        intelligence: 38,
+        intelligenceIsEstimated: true,
+        speed: 28,
         contextTokens: 262_144,
-        activeParamsB: 27.0
+        activeParamsB: 9.7
     )
 
     /// Qwen 3.8 27B, the pick this app leads with on any Mac that can hold it.
@@ -423,10 +417,11 @@ extension RecommendedModelPick {
     ]
 
     /// Qwen picks, ascending by size — the Recommended pane's other family
-    /// section. One row per model: the 6/8-bit and iQ variants of these
-    /// checkpoints live in Discover search instead.
+    /// section. The 6/8-bit and iQ variants of these checkpoints live in
+    /// Discover search instead, and the 3.6 27B MTP pack stays out on the
+    /// maintainer's call (the 3.8 is better for the same RAM).
     static let qwenCatalog: [RecommendedModelPick] = [
-        .bonsai2_27b, .qwen36_27bMtp, .qwen38_27b, .qwen36_35bA3b,
+        .mimo9b, .bonsai2_27b, .qwen38_27b, .qwen36_35bA3b,
     ]
 
     /// The largest models this app runs, ascending by on-disk size (the app's

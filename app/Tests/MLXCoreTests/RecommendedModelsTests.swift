@@ -131,12 +131,11 @@ final class RecommendedModelsTests: XCTestCase {
 
     /// The MTP-scored picks are the ones whose checkpoint (or bundled
     /// sidecar) ships a draft head this app runs by default, scored from the
-    /// bench's `mtp` cells: the 35B-A3B is the fastest thing here,
-    /// Flash-Next sits above the 27B, and the 3.6 27B pack scores its
-    /// sidecar rate.
+    /// bench's `mtp` cells: the 35B-A3B is the fastest thing here and
+    /// Flash-Next sits above the 27B.
     func testMtpScoredPicksAreTheOnesShippingADraftHead() {
         let mtp = Set(allRecommended.filter(\.speedIsWithMtp).map(\.id))
-        XCTAssertEqual(mtp, ["qwen38-27b", "qwen36-27b-mtp", "bonsai2-27b", "qwen36-35b-a3b", "qwen38-flash-next"])
+        XCTAssertEqual(mtp, ["qwen38-27b", "bonsai2-27b", "qwen36-35b-a3b", "qwen38-flash-next"])
         XCTAssertEqual(RecommendedModelPick.qwen36_35bA3b.speed, allRecommended.map(\.speed).max())
         XCTAssertGreaterThan(RecommendedModelPick.qwen38FlashNext.speed, RecommendedModelPick.qwen38_27b.speed)
         XCTAssertLessThan(RecommendedModelPick.qwen38FlashNext.speed, RecommendedModelPick.qwen36_35bA3b.speed)
@@ -175,7 +174,7 @@ final class RecommendedModelsTests: XCTestCase {
     /// point of carrying the flag.
     func testOnlyTheModelsAbsentFromTheIndexAreFlaggedEstimated() {
         let estimated = Set(allRecommended.filter(\.intelligenceIsEstimated).map(\.id))
-        XCTAssertEqual(estimated, ["qwen38-27b", "bonsai2-27b", "qwen38-flash-next"])
+        XCTAssertEqual(estimated, ["qwen38-27b", "bonsai2-27b", "qwen38-flash-next", "mimo-9b"])
     }
 
     /// The bar fractions the pane draws stay inside the track, and context —
@@ -199,7 +198,7 @@ final class RecommendedModelsTests: XCTestCase {
     func testContextWindowsMatchTheCheckpoints() {
         XCTAssertEqual(RecommendedModelPick.gemmaE4B.contextTokens, 131_072)
         XCTAssertEqual(RecommendedModelPick.gemma31B.contextTokens, 262_144)
-        XCTAssertEqual(RecommendedModelPick.qwen36_27bMtp.contextTokens, 262_144)
+        XCTAssertEqual(RecommendedModelPick.mimo9b.contextTokens, 262_144)
         XCTAssertEqual(RecommendedModelPick.qwen38_27b.contextTokens, 262_144)
         XCTAssertEqual(RecommendedModelPick.qwen38FlashNext.contextTokens, 262_144)
         XCTAssertEqual(RecommendedModelPick.deepseekV4Flash.contextTokens, 1_048_576)
@@ -211,8 +210,8 @@ final class RecommendedModelsTests: XCTestCase {
         XCTAssertEqual(RecommendedModelPick.qwen36_35bA3b.activeParamsB, 3.0)  // 35B total
         XCTAssertEqual(RecommendedModelPick.qwen38FlashNext.activeParamsB, 6.0) // 125B total
         XCTAssertEqual(RecommendedModelPick.deepseekV4Flash.activeParamsB, 13.0) // 284B total
+        XCTAssertEqual(RecommendedModelPick.mimo9b.activeParamsB, 9.7) // dense
         XCTAssertEqual(RecommendedModelPick.gemma31B.activeParamsB, 31.0)      // dense
-        XCTAssertEqual(RecommendedModelPick.qwen36_27bMtp.activeParamsB, 27.0) // dense
     }
 
     // MARK: - Starter recommendation (RAM tiers)
@@ -342,37 +341,41 @@ final class RecommendedModelsTests: XCTestCase {
 
     // MARK: - Known-good entries (regression pins)
 
-    /// One row per model ddalcu publishes — including BOTH 27B packs: the
-    /// 3.6 with the MTP sidecar (the pack this app's own MTP work was built
-    /// against) and the 3.8 that supersedes it (newer weights, vision, the
-    /// head inside the checkpoint). Four Qwen rows total; the 6/8-bit and
-    /// iQ variants stay out (Discover search carries every quant).
-    func testBothQwenTwentySevenBPacksAreListedOnceEach() {
+    /// The Qwen section is one row per size class: the 9B entry, Bonsai for
+    /// 16 GB Macs, the 27B, and the 35B-A3B — in that order. The 3.6 27B MTP
+    /// pack stays out on the maintainer's call (the 3.8 is better for the
+    /// same RAM); the 6/8-bit and iQ variants stay out (Discover search
+    /// carries every quant).
+    func testQwenSectionIsOneRowPerSizeClass() {
         let repoIds = RecommendedModelPick.qwenCatalog.map(\.repoId)
-        XCTAssertTrue(repoIds.contains("ddalcu/Qwen3.8-27B-MLX-Serve-4bit"))
-        XCTAssertTrue(repoIds.contains("ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve"))
-        XCTAssertEqual(RecommendedModelPick.qwenCatalog.count, 4)
-        XCTAssertFalse(repoIds.contains { $0.contains("6bit") || $0.contains("8bit") || $0.contains("iQ") })
+        XCTAssertEqual(repoIds, [
+            "ddalcu/MiMo-V2.6-Distill-Qwen-9B-MLX-Serve-4bit",
+            "prism-ml/Ternary-Bonsai-2-27B-mlx-2bit",
+            "ddalcu/Qwen3.8-27B-MLX-Serve-4bit",
+            "ddalcu/Qwen3.6-35B-A3B-MLX-Serve-4bit",
+        ])
+        XCTAssertFalse(repoIds.contains("ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve"))
     }
 
-    /// The 3.6 27B MTP pack: on-disk size from the repo's blob totals, the
-    /// index's measured score, MTP-rate speed (the sidecar runs by default
-    /// on a dense target), 256K window, 4-bit label.
-    func testQwen3627BPackIsPinned() {
-        let p = RecommendedModelPick.qwen36_27bMtp
-        XCTAssertEqual(p.id, "qwen36-27b-mtp")
-        XCTAssertEqual(p.repoId, "ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve")
+    /// The MiMo 9B pack: on-disk size from the repo's blob totals, an
+    /// estimated score (the index has no entry for the distill), the 9B-class
+    /// rate, a 256K window, 4-bit label, comfortable on a 16 GB Mac.
+    func testMiMo9BPackIsPinned() {
+        let p = RecommendedModelPick.mimo9b
+        XCTAssertEqual(p.id, "mimo-9b")
+        XCTAssertEqual(p.repoId, "ddalcu/MiMo-V2.6-Distill-Qwen-9B-MLX-Serve-4bit")
         XCTAssertEqual(p.family, .qwen)
-        XCTAssertEqual(p.sizeGB, 15.5, accuracy: 0.01)
-        XCTAssertEqual(p.approxRAMNeededGB, 18.6, accuracy: 0.01)
-        XCTAssertEqual(p.intelligence, 62)
-        XCTAssertFalse(p.intelligenceIsEstimated)
-        XCTAssertEqual(p.speed, 37)
-        XCTAssertTrue(p.speedIsWithMtp)
+        XCTAssertEqual(p.sizeGB, 7.1, accuracy: 0.01)
+        XCTAssertEqual(p.approxRAMNeededGB, 8.5, accuracy: 0.05)
+        XCTAssertEqual(p.intelligence, 38)
+        XCTAssertTrue(p.intelligenceIsEstimated)
+        XCTAssertEqual(p.speed, 28)
+        XCTAssertFalse(p.speedIsWithMtp)
         XCTAssertEqual(p.contextTokens, 262_144)
-        XCTAssertEqual(p.activeParamsB, 27.0)
+        XCTAssertEqual(p.activeParamsB, 9.7)
         XCTAssertEqual(p.quantLabel, "4-bit")
-        XCTAssertTrue(p.meetsSystemRequirements(physicalMemoryBytes: 24 * GiB))
+        XCTAssertTrue(p.meetsSystemRequirements(physicalMemoryBytes: 16 * GiB))
+        XCTAssertFalse(p.meetsSystemRequirements(physicalMemoryBytes: 8 * GiB))
     }
 
     /// Bonsai 2 is the Qwen 3.8 27B squeezed to 2 bits so it fits a 16 GB Mac.
@@ -430,14 +433,13 @@ final class RecommendedModelsTests: XCTestCase {
                        "the ds4 GGUF pick is superseded by the native mirror")
     }
 
-    /// The entry-level Qwen row is Bonsai 2 — the 9B took its retirement
-    /// when Bonsai became the small-Mac Qwen — and the ancient 0.8B toy must
-    /// never come back: too small to be a meaningful comparison against the
-    /// Gemma lineup.
-    func testEntryLevelQwenPickIsBonsaiNotAToy() {
+    /// The entry-level Qwen row is the MiMo 9B (7.1 GB) — and the ancient
+    /// 0.8B toy must never come back: too small to be a meaningful
+    /// comparison against the Gemma lineup.
+    func testEntryLevelQwenPickIsMiMoNotAToy() {
         let repoIds = RecommendedModelPick.qwenCatalog.map(\.repoId)
-        XCTAssertEqual(RecommendedModelPick.qwenCatalog.first?.id, "bonsai2-27b",
-                       "Bonsai (8.6 GB) is the smallest Qwen row")
+        XCTAssertEqual(RecommendedModelPick.qwenCatalog.first?.id, "mimo-9b",
+                       "MiMo 9B (7.1 GB) is the smallest Qwen row")
         XCTAssertFalse(repoIds.contains { $0.contains("0.8B") })
     }
 

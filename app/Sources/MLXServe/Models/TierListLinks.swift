@@ -17,7 +17,7 @@ enum TierListLinks {
         case "mlx-community/gemma-4-26b-a4b-it-4bit",
              "mlx-community/gemma-4-26b-a4b-it-8bit": "gemma-4-26b-a4b"
         case "mlx-community/gemma-4-31b-it-4bit": "gemma-4-31b"
-        case "ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve": "qwen3.6-27b-mtp"
+        case "ddalcu/MiMo-V2.6-Distill-Qwen-9B-MLX-Serve-4bit": "mimo-v2.6-9b"
         case "ddalcu/Qwen3.8-27B-MLX-Serve-4bit": "qwen3.8-27b"
         case "prism-ml/Ternary-Bonsai-2-27B-mlx-2bit": "ternary-bonsai-2-27b"
         case "ddalcu/DeepSeek-V4-Flash-0731-iQ-MLX-3.3bpw": "deepseek-v4-flash"

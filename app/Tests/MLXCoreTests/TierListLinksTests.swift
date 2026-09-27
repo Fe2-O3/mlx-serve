@@ -14,7 +14,7 @@ final class TierListLinksTests: XCTestCase {
 
     func testAnchorsAreThePageSeedIdsVerbatim() {
         XCTAssertEqual(TierListLinks.anchor(repoId: "ddalcu/Qwen3.8-27B-MLX-Serve-4bit"), "qwen3.8-27b")
-        XCTAssertEqual(TierListLinks.anchor(repoId: "ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve"), "qwen3.6-27b-mtp")
+        XCTAssertEqual(TierListLinks.anchor(repoId: "ddalcu/MiMo-V2.6-Distill-Qwen-9B-MLX-Serve-4bit"), "mimo-v2.6-9b")
         XCTAssertEqual(TierListLinks.anchor(repoId: "prism-ml/Ternary-Bonsai-2-27B-mlx-2bit"), "ternary-bonsai-2-27b")
         XCTAssertEqual(TierListLinks.anchor(repoId: "mlx-community/gemma-4-e4b-it-4bit"), "gemma-4-e4b")
         XCTAssertEqual(TierListLinks.anchor(repoId: "ddalcu/DeepSeek-V4-Flash-0731-iQ-MLX-3.3bpw"), "deepseek-v4-flash")

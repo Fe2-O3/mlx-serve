@@ -703,12 +703,12 @@
     { id: "ling-3.0-flash",   name: "Ling 3.0 Flash",    params: "124B (5B act)", sizeGb: 70, minRam: 96,  tags: ["moe", "fast"], downloads: 0, paramsB: 124, activeB: 5.1 },
     { id: "deepseek-v4-flash", name: "DeepSeek-V4-Flash", params: "284B (13B act)", sizeGb: 115, minRam: 128, tags: ["moe"], downloads: 0, paramsB: 284, activeB: 13 },
     { id: "hy3",              name: "Hunyuan 3 295B",    params: "295B MoE",     sizeGb: 95,  minRam: 128, tags: ["moe"], downloads: 0, paramsB: 295, activeB: 13 },
-    // App-pane rows live here too so the app can deep-link every pick. Both
-    // are unscored by Artificial Analysis, so they wait in the unranked table
-    // like the other new rows rather than being placed on a guess. The Bonsai
-    // seed shares the live group's id, so it only shows when the HF fetch
-    // fails — online the group's own downloads win.
-    { id: "qwen3.6-27b-mtp",  name: "Qwen3.6 27B MTP",   params: "27B",          sizeGb: 15.5, minRam: 32, tags: ["fast"], downloads: 0, paramsB: 27.4, activeB: 27.4 },
+    // The app-pane row lives here too so the app can deep-link every pick.
+    // It is unscored by Artificial Analysis, so it waits in the unranked
+    // table like the other new rows rather than being placed on a guess.
+    // The Bonsai seed shares the live group's id, so it only shows when the
+    // HF fetch fails — online the group's own downloads win.
+    { id: "mimo-v2.6-9b",      name: "MiMo 9B",           params: "9B",           sizeGb: 7.1, minRam: 16, tags: ["vision", "fast"], downloads: 0, paramsB: 9.7, activeB: 9.7 },
     { id: "ternary-bonsai-2-27b", name: "Bonsai 2 27B",  params: "27B (2-bit)",  sizeGb: 8.0, minRam: 16, tags: ["fast"], downloads: 0, paramsB: 27.4, activeB: 27.4 },
   ];
   const TAG_LABELS = { vision: "Vision", moe: "MoE", fast: "Fast" };
@@ -1434,7 +1434,7 @@
   // maps repos to these ids, and every row below carries id="tier-<id>" so
   // those links land. Keep the two lists in step.
   const APP_PICKS = new Set(["gemma-4-e4b", "gemma-4-12b", "gemma-4-26b-a4b",
-    "gemma-4-31b", "qwen3.6-27b-mtp", "qwen3.8-27b", "ternary-bonsai-2-27b",
+    "gemma-4-31b", "mimo-v2.6-9b", "qwen3.8-27b", "ternary-bonsai-2-27b",
     "qwen3.6-35b-a3b", "qwen3.8-flash-next", "deepseek-v4-flash"]);
   function chip(m, t) {
     const el = document.createElement("div");
