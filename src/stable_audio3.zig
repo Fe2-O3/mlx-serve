@@ -1004,7 +1004,7 @@ fn concatA(x: mlx.mlx_array, y: mlx.mlx_array, axis: c_int, s: S) !mlx.mlx_array
 /// mx.fast.scaled_dot_product_attention semantics (fast.cpp): promote q/k/v to
 /// their result type, scale q, scores = q @ kᵀ, softmax precise, p @ v.
 /// No mask — the reference passes none.
-fn sdpa(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f32, s: S) !mlx.mlx_array {
+fn sdpa(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f32, mask: ?mlx.mlx_array, s: S) !mlx.mlx_array {
     const final: mlx.mlx_dtype = blk: {
         const dqs = mlx.mlx_array_dtype(q);
         if (dqs == .float32 or mlx.mlx_array_dtype(k) == .float32 or mlx.mlx_array_dtype(v) == .float32) break :blk .float32;
@@ -1028,6 +1028,12 @@ fn sdpa(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f32, s: S) 
     var scores = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_matmul(&scores, qs, kt, s));
     defer _ = mlx.mlx_array_free(scores);
+    if (mask) |m| {
+        var masked = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_add(&masked, scores, m, s));
+        _ = mlx.mlx_array_free(scores);
+        scores = masked; // defer frees the reassigned handle — deliberate
+    }
     var p = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_softmax_axis(&p, scores, 3, true, s));
     defer _ = mlx.mlx_array_free(p);
@@ -1090,9 +1096,9 @@ fn ditSelfAttn(a: std.mem.Allocator, w: *const Weights, cfg: *const DitJson, x: 
     }
 
     // out = SDPA(q,k,v) − SDPA(q_diff,k_diff,v)
-    const main = try sdpa(normed[0], normed[1], heads[2], scale, s);
+    const main = try sdpa(normed[0], normed[1], heads[2], scale, null, s);
     defer _ = mlx.mlx_array_free(main);
-    const diff = try sdpa(normed[2], normed[3], heads[2], scale, s);
+    const diff = try sdpa(normed[2], normed[3], heads[2], scale, null, s);
     defer _ = mlx.mlx_array_free(diff);
     const out = try subA(main, diff, s);
     defer _ = mlx.mlx_array_free(out);
@@ -1174,9 +1180,9 @@ fn ditCrossAttn(a: std.mem.Allocator, w: *const Weights, cfg: *const DitJson, x:
     const k1 = try rmsFast(ch[1], kw, cfg.qk_norm_eps, s);
     defer _ = mlx.mlx_array_free(k1);
 
-    const main = try sdpa(q0, k0, ch[2], scale, s);
+    const main = try sdpa(q0, k0, ch[2], scale, null, s);
     defer _ = mlx.mlx_array_free(main);
-    const diff = try sdpa(q1, k1, ch[2], scale, s);
+    const diff = try sdpa(q1, k1, ch[2], scale, null, s);
     defer _ = mlx.mlx_array_free(diff);
     const out = try subA(main, diff, s);
     defer _ = mlx.mlx_array_free(out);
@@ -1877,4 +1883,609 @@ test "stable_audio3 oracle: ping-pong sampler latents match reference" {
 
 fn allocPrint_noise(a: std.mem.Allocator, k: usize) ![]u8 {
     return std.fmt.allocPrint(a, "noise_{d:0>2}.f32.raw", .{k});
+}
+
+// ── SAME-L decoder (reference = same_l_decoder.py) ──────────────────────────
+//
+// `same_l_decoder.safetensors` ships dense f32 verbatim (no quant keys).
+// Latents f32 [B, 256, T] → patches f32 [B, 512, T*16]. Constants are
+// architectural to SAME-L (small variants use SAME-S — its own port).
+
+const SameL = struct {
+    const DIM: c_int = 1536;
+    const HEADS: c_int = 24;
+    const HEAD_DIM: c_int = 64;
+    const ROPE_DIMS: c_int = 32;
+    const ROPE_BASE: f32 = 10000.0;
+    const BLOCKS: usize = 12;
+    const FF_INNER: c_int = 4608;
+    const SIN_START: usize = 5;
+    const OUT_CH: c_int = 512;
+    const SUB_CHUNK: c_int = 17; // query positions per latent
+    const W: c_int = 51; // 3 * SUB_CHUNK KV positions per window
+};
+
+fn concatMany(x: []const mlx.mlx_array, axis: c_int, s: S) !mlx.mlx_array {
+    const v = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(v);
+    for (x) |e| _ = mlx.mlx_vector_array_append_value(v, e);
+    var o = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_concatenate_axis(&o, v, axis, s));
+    return o;
+}
+
+/// DyT: gamma * tanh(alpha * x) + beta (alpha [1], gamma/beta [dim], last axis).
+fn dyt(a: std.mem.Allocator, w: *const Weights, prefix: []const u8, x: mlx.mlx_array, s: S) !mlx.mlx_array {
+    const ak = try std.fmt.allocPrint(a, "{s}.alpha", .{prefix});
+    defer a.free(ak);
+    const gk = try std.fmt.allocPrint(a, "{s}.gamma", .{prefix});
+    defer a.free(gk);
+    const bk = try std.fmt.allocPrint(a, "{s}.beta", .{prefix});
+    defer a.free(bk);
+    const alpha = w.get(ak) orelse return error.MissingWeight;
+    const gamma = w.get(gk) orelse return error.MissingWeight;
+    const beta = w.get(bk) orelse return error.MissingWeight;
+    const ax = try mulA(x, alpha, s);
+    defer _ = mlx.mlx_array_free(ax);
+    const th = try tanhA(ax, s);
+    defer _ = mlx.mlx_array_free(th);
+    const gt = try mulA(th, gamma, s);
+    defer _ = mlx.mlx_array_free(gt);
+    return addA(gt, beta, s);
+}
+
+/// Static SWA bias [G, 1, 51]: padded group position g*17+w is valid iff
+/// 17 <= pos < T+17 (T = expanded sequence length), else -1e9.
+fn swaBoundary(a: std.mem.Allocator, g_count: usize, t_exp: usize, s: S) !mlx.mlx_array {
+    _ = s;
+    const w: usize = @intCast(SameL.W);
+    const buf = try a.alloc(f32, g_count * w);
+    defer a.free(buf);
+    for (0..g_count) |g| {
+        for (0..w) |wi| {
+            const pos = g * @as(usize, @intCast(SameL.SUB_CHUNK)) + wi;
+            buf[g * w + wi] = if (pos >= @as(usize, @intCast(SameL.SUB_CHUNK)) and pos < t_exp + @as(usize, @intCast(SameL.SUB_CHUNK))) 0.0 else -1e9;
+        }
+    }
+    const sh = [3]c_int{ @intCast(g_count), 1, @intCast(w) };
+    return mlx.mlx_array_new_data(buf.ptr, &sh, 3, .float32);
+}
+
+/// Sliding windows over the group axis: gp [B, H, G+2, 17, D] (K/V padded by
+/// one group each side) → [B, H, G, 51, D] where window g = groups [g, g+3).
+fn swaWindows(a: std.mem.Allocator, gp: mlx.mlx_array, g_count: usize, s: S) !mlx.mlx_array {
+    const shp = mlx.getShape(gp);
+    const b = shp[0];
+    const h = shp[1];
+    const d = shp[4];
+    const pieces = try a.alloc(mlx.mlx_array, g_count);
+    defer a.free(pieces);
+    for (0..g_count) |gi| {
+        const lo = [5]c_int{ 0, 0, @intCast(gi), 0, 0 };
+        const hi = [5]c_int{ b, h, @intCast(gi + 3), @intCast(SameL.SUB_CHUNK), d };
+        const stp = [5]c_int{ 1, 1, 1, 1, 1 };
+        var sl = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_slice(&sl, gp, &lo, 5, &hi, 5, &stp, 5, s));
+        defer _ = mlx.mlx_array_free(sl);
+        var ct = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_contiguous(&ct, sl, false, s));
+        defer _ = mlx.mlx_array_free(ct);
+        var r = mlx.mlx_array_new();
+        const rsh = [5]c_int{ b, h, 1, SameL.W, d };
+        try mlx.check(mlx.mlx_reshape(&r, ct, &rsh, 5, s));
+        pieces[gi] = r;
+    }
+    const out = try concatMany(pieces, 2, s);
+    for (pieces) |pi| _ = mlx.mlx_array_free(pi);
+    return out;
+}
+
+fn headsView(a: std.mem.Allocator, x: mlx.mlx_array, g_count: usize, s: S) !mlx.mlx_array {
+    // [B, H, T, D] → [B, H, G, 17, D] → [B*G, H, 17, D]
+    _ = a;
+    const shp = mlx.getShape(x);
+    const b = shp[0];
+    const h = shp[1];
+    const d = shp[3];
+    const gsh = [5]c_int{ b, h, @intCast(g_count), SameL.SUB_CHUNK, d };
+    var g4 = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_reshape(&g4, x, &gsh, 5, s));
+    defer _ = mlx.mlx_array_free(g4);
+    var tr = mlx.mlx_array_new();
+    const axes5 = [5]c_int{ 0, 2, 1, 3, 4 };
+    try mlx.check(mlx.mlx_transpose_axes(&tr, g4, &axes5, 5, s));
+    defer _ = mlx.mlx_array_free(tr);
+    const tsh = [4]c_int{ b * @as(c_int, @intCast(g_count)), h, SameL.SUB_CHUNK, d };
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_reshape(&out, tr, &tsh, 4, s));
+    return out;
+}
+
+/// Windowed [B, H, G, 51, D] → [B*G, H, 51, D] (group axis folds into batch).
+fn windowsFlat(x5: mlx.mlx_array, s: S) !mlx.mlx_array {
+    var tr = mlx.mlx_array_new();
+    const axes5 = [5]c_int{ 0, 2, 1, 3, 4 };
+    try mlx.check(mlx.mlx_transpose_axes(&tr, x5, &axes5, 5, s));
+    defer _ = mlx.mlx_array_free(tr);
+    const shp = mlx.getShape(tr);
+    const fsh = [4]c_int{ shp[0] * shp[1], shp[2], shp[3], shp[4] };
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_reshape(&out, tr, &fsh, 4, s));
+    return out;
+}
+
+/// [B*G, H, G-ish] flat diff output → [B, H, T, D] (inverse of headsView).
+fn headsRestore(a: std.mem.Allocator, flat: mlx.mlx_array, b: c_int, h: c_int, g_count: usize, s: S) !mlx.mlx_array {
+    _ = a;
+    const d = mlx.getShape(flat)[3];
+    const gsh = [5]c_int{ b, @intCast(g_count), h, SameL.SUB_CHUNK, d };
+    var g4 = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_reshape(&g4, flat, &gsh, 5, s));
+    defer _ = mlx.mlx_array_free(g4);
+    var tr = mlx.mlx_array_new();
+    const axes5 = [5]c_int{ 0, 2, 1, 3, 4 };
+    try mlx.check(mlx.mlx_transpose_axes(&tr, g4, &axes5, 5, s));
+    defer _ = mlx.mlx_array_free(tr);
+    const tsh = [4]c_int{ b, h, @intCast(g_count * @as(usize, @intCast(SameL.SUB_CHUNK))), d };
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_reshape(&out, tr, &tsh, 4, s));
+    return out;
+}
+
+/// Differential self-attention for one decoder block: x [B, T, 1536] → [B, T, 1536].
+/// T here is the EXPANDED sequence (T_lat * 17). T <= 17 takes the batched
+/// full-attention arm; otherwise SWA with the static 17x51 mask + boundary.
+fn decAttn(a: std.mem.Allocator, w: *const Weights, x: mlx.mlx_array, blk: usize, swa_mask: mlx.mlx_array, s: S) !mlx.mlx_array {
+    const b = mlx.getShape(x)[0];
+    const t = mlx.getShape(x)[1];
+    const h = SameL.HEADS;
+    const d = SameL.HEAD_DIM;
+
+    const qkp = try std.fmt.allocPrint(a, "blocks.{d}.attn.to_qkv", .{blk});
+    defer a.free(qkp);
+    const qkv = try lin(w, a, x, qkp, s);
+    defer _ = mlx.mlx_array_free(qkv);
+    var parts: [5]mlx.mlx_array = undefined;
+    try splitEqual(qkv, 5, -1, &parts, s);
+    defer {
+        for (parts) |p| _ = mlx.mlx_array_free(p);
+    }
+
+    var hd: [5]mlx.mlx_array = undefined;
+    for (0..5) |i| {
+        const rsh = [4]c_int{ b, t, h, d };
+        var r = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_reshape(&r, parts[i], &rsh, 4, s));
+        defer _ = mlx.mlx_array_free(r);
+        var tr = mlx.mlx_array_new();
+        const axes = [4]c_int{ 0, 2, 1, 3 };
+        try mlx.check(mlx.mlx_transpose_axes(&tr, r, &axes, 4, s));
+        hd[i] = tr;
+    }
+    defer {
+        for (hd) |hh| _ = mlx.mlx_array_free(hh);
+    }
+
+    const qnp = try std.fmt.allocPrint(a, "blocks.{d}.attn.q_norm", .{blk});
+    defer a.free(qnp);
+    const knp = try std.fmt.allocPrint(a, "blocks.{d}.attn.k_norm", .{blk});
+    defer a.free(knp);
+    var q1 = try dyt(a, w, qnp, hd[0], s);
+    defer _ = mlx.mlx_array_free(q1);
+    var k1 = try dyt(a, w, knp, hd[1], s);
+    defer _ = mlx.mlx_array_free(k1);
+    var q2 = try dyt(a, w, qnp, hd[3], s);
+    defer _ = mlx.mlx_array_free(q2);
+    var k2 = try dyt(a, w, knp, hd[4], s);
+    defer _ = mlx.mlx_array_free(k2);
+
+    inline for (.{ &q1, &k1, &q2, &k2 }) |pt| {
+        var rp = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_fast_rope(&rp, pt.*, SameL.ROPE_DIMS, false, mlx.mlx_optional_float.some(SameL.ROPE_BASE), 1.0, 0, .{ .ctx = null }, s));
+        _ = mlx.mlx_array_free(pt.*);
+        pt.* = rp;
+    }
+
+    var diff: mlx.mlx_array = undefined;
+    if (t <= SameL.SUB_CHUNK) {
+        // batched arm: Q = [q1, q2] heads-concat, K = [k1, k2], V = [v, v]
+        const Q = try concatMany(&.{ q1, q2 }, 1, s);
+        defer _ = mlx.mlx_array_free(Q);
+        const K = try concatMany(&.{ k1, k2 }, 1, s);
+        defer _ = mlx.mlx_array_free(K);
+        const V = try concatMany(&.{ hd[2], hd[2] }, 1, s);
+        defer _ = mlx.mlx_array_free(V);
+        const out = try sdpa(Q, K, V, 0.125, null, s);
+        defer _ = mlx.mlx_array_free(out);
+        var o: [2]mlx.mlx_array = undefined;
+        try splitEqual(out, 2, 1, &o, s);
+        defer {
+            for (o) |oo| _ = mlx.mlx_array_free(oo);
+        }
+        diff = try subA(o[0], o[1], s);
+    } else {
+        const g_count: usize = @intCast(@divExact(t, SameL.SUB_CHUNK));
+        // pad K/V by one SUB_CHUNK on both sides
+        const psh = [4]c_int{ b, h, SameL.SUB_CHUNK, d };
+        var z = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_zeros(&z, &psh, 4, .float32, s));
+        defer _ = mlx.mlx_array_free(z);
+        const k1p = try concatMany(&.{ z, k1, z }, 2, s);
+        defer _ = mlx.mlx_array_free(k1p);
+        const k2p = try concatMany(&.{ z, k2, z }, 2, s);
+        defer _ = mlx.mlx_array_free(k2p);
+        const vp = try concatMany(&.{ z, hd[2], z }, 2, s);
+        defer _ = mlx.mlx_array_free(vp);
+
+        // group views [B, H, G+2, 17, D]
+        const gsh = [5]c_int{ b, h, @intCast(g_count + 2), SameL.SUB_CHUNK, d };
+        var k1g = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_reshape(&k1g, k1p, &gsh, 5, s));
+        defer _ = mlx.mlx_array_free(k1g);
+        var k2g = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_reshape(&k2g, k2p, &gsh, 5, s));
+        defer _ = mlx.mlx_array_free(k2g);
+        var vg = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_reshape(&vg, vp, &gsh, 5, s));
+        defer _ = mlx.mlx_array_free(vg);
+
+        const k1w = try swaWindows(a, k1g, g_count, s);
+        defer _ = mlx.mlx_array_free(k1w);
+        const k2w = try swaWindows(a, k2g, g_count, s);
+        defer _ = mlx.mlx_array_free(k2w);
+        const vw = try swaWindows(a, vg, g_count, s);
+        defer _ = mlx.mlx_array_free(vw);
+
+        // boundary bias → [B*G, 1, 17, 51]
+        const bd = try swaBoundary(a, g_count, @intCast(t), s);
+        defer _ = mlx.mlx_array_free(bd);
+        const comb = try addA(swa_mask, bd, s); // [G,17,51] (mask [17,51] + [G,1,51])
+        defer _ = mlx.mlx_array_free(comb);
+        var comb1 = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_expand_dims(&comb1, comb, 0, s));
+        defer _ = mlx.mlx_array_free(comb1);
+        const bsh = [4]c_int{ b, @intCast(g_count), SameL.SUB_CHUNK, SameL.W };
+        var bcb = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_broadcast_to(&bcb, comb1, &bsh, 4, s));
+        defer _ = mlx.mlx_array_free(bcb);
+        const fsh = [4]c_int{ b * @as(c_int, @intCast(g_count)), 1, SameL.SUB_CHUNK, SameL.W };
+        var msk = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_reshape(&msk, bcb, &fsh, 4, s));
+        defer _ = mlx.mlx_array_free(msk);
+
+        // flat heads
+        const q1f = try headsView(a, q1, g_count, s);
+        defer _ = mlx.mlx_array_free(q1f);
+        const q2f = try headsView(a, q2, g_count, s);
+        defer _ = mlx.mlx_array_free(q2f);
+        const k1f = try windowsFlat(k1w, s);
+        defer _ = mlx.mlx_array_free(k1f);
+        const k2f = try windowsFlat(k2w, s);
+        defer _ = mlx.mlx_array_free(k2f);
+        const vf = try windowsFlat(vw, s);
+        defer _ = mlx.mlx_array_free(vf);
+
+        const Q = try concatMany(&.{ q1f, q2f }, 1, s);
+        defer _ = mlx.mlx_array_free(Q);
+        const K = try concatMany(&.{ k1f, k2f }, 1, s);
+        defer _ = mlx.mlx_array_free(K);
+        const V = try concatMany(&.{ vf, vf }, 1, s);
+        defer _ = mlx.mlx_array_free(V);
+
+        const out = try sdpa(Q, K, V, 0.125, msk, s);
+        defer _ = mlx.mlx_array_free(out);
+        var o: [2]mlx.mlx_array = undefined;
+        try splitEqual(out, 2, 1, &o, s);
+        defer {
+            for (o) |oo| _ = mlx.mlx_array_free(oo);
+        }
+        const dflat = try subA(o[0], o[1], s);
+        defer _ = mlx.mlx_array_free(dflat);
+        diff = try headsRestore(a, dflat, b, h, g_count, s);
+    }
+
+    var merged = mlx.mlx_array_new();
+    const maxes = [4]c_int{ 0, 2, 1, 3 };
+    try mlx.check(mlx.mlx_transpose_axes(&merged, diff, &maxes, 4, s));
+    defer _ = mlx.mlx_array_free(merged);
+    _ = mlx.mlx_array_free(diff);
+    const msh = [3]c_int{ b, t, SameL.DIM };
+    var flat = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_reshape(&flat, merged, &msh, 3, s));
+    defer _ = mlx.mlx_array_free(flat);
+
+    const op = try std.fmt.allocPrint(a, "blocks.{d}.attn.to_out", .{blk});
+    defer a.free(op);
+    return lin(w, a, flat, op, s);
+}
+
+/// Feed-forward: glu_proj → (value ⊗ gate), sin(·π) gate for blocks >= 5 else SiLU.
+fn decFF(a: std.mem.Allocator, w: *const Weights, x: mlx.mlx_array, blk: usize, s: S) !mlx.mlx_array {
+    const gp = try std.fmt.allocPrint(a, "blocks.{d}.ff.glu_proj", .{blk});
+    defer a.free(gp);
+    const g = try lin(w, a, x, gp, s);
+    defer _ = mlx.mlx_array_free(g);
+    var halves: [2]mlx.mlx_array = undefined;
+    try splitEqual(g, 2, -1, &halves, s);
+    defer {
+        for (halves) |hh| _ = mlx.mlx_array_free(hh);
+    }
+    var act: mlx.mlx_array = undefined;
+    if (blk >= SameL.SIN_START) {
+        const ang = try mulScalar(halves[1], @as(f32, std.math.pi), s);
+        defer _ = mlx.mlx_array_free(ang);
+        var sn = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_sin(&sn, ang, s));
+        defer _ = mlx.mlx_array_free(sn);
+        act = try mulA(halves[0], sn, s);
+    } else {
+        const gl = try silu(halves[1], s);
+        defer _ = mlx.mlx_array_free(gl);
+        act = try mulA(halves[0], gl, s);
+    }
+    defer _ = mlx.mlx_array_free(act);
+    const dp = try std.fmt.allocPrint(a, "blocks.{d}.ff.proj_out", .{blk});
+    defer a.free(dp);
+    return lin(w, a, act, dp, s);
+}
+
+/// `rearrange("b (c h) l -> b c (l h)", h=256)` — patches [B, 512, L] → [B, 2, L*256].
+pub fn patchedDecode(a: std.mem.Allocator, patches: mlx.mlx_array, s: S) !mlx.mlx_array {
+    _ = a;
+    const shp = mlx.getShape(patches);
+    const b = shp[0];
+    const l = shp[2];
+    const rsh = [4]c_int{ b, 2, 256, l };
+    var r = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_reshape(&r, patches, &rsh, 4, s));
+    defer _ = mlx.mlx_array_free(r);
+    var tr = mlx.mlx_array_new();
+    const axes = [4]c_int{ 0, 1, 3, 2 };
+    try mlx.check(mlx.mlx_transpose_axes(&tr, r, &axes, 4, s));
+    defer _ = mlx.mlx_array_free(tr);
+    const osh = [3]c_int{ b, 2, l * 256 };
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_reshape(&out, tr, &osh, 3, s));
+    return out;
+}
+
+pub const SameLDecoder = struct {
+    w: Weights,
+    swa_mask: mlx.mlx_array, // [17, 51] f32, 0 / -1e9
+
+    pub fn load(io: std.Io, a: std.mem.Allocator, model_dir: []const u8) !SameLDecoder {
+        var w = try loadFileWeights(a, model_dir, "same_l_decoder.safetensors");
+        errdefer w.deinit();
+        // static mask: valid iff kv >= q and kv <= q + 34 (2*BLOCK_SIZE)
+        const w_n: usize = @intCast(SameL.W);
+        const q_n: usize = @intCast(SameL.SUB_CHUNK);
+        const buf = try a.alloc(f32, q_n * w_n);
+        defer a.free(buf);
+        for (0..q_n) |q| {
+            for (0..w_n) |kv| {
+                buf[q * w_n + kv] = if (kv >= q and kv <= q + 2 * q_n) 0.0 else -1e9;
+            }
+        }
+        const msh = [2]c_int{ SameL.SUB_CHUNK, SameL.W };
+        const m = mlx.mlx_array_new_data(buf.ptr, &msh, 2, .float32);
+        _ = io;
+        return .{ .w = w, .swa_mask = m };
+    }
+
+    pub fn deinit(self: *SameLDecoder) void {
+        _ = mlx.mlx_array_free(self.swa_mask);
+        self.w.deinit();
+    }
+
+    /// One un-chunked forward: latents [B, 256, T] → patches [B, 512, T*16].
+    pub fn decode(self: *SameLDecoder, alloc: std.mem.Allocator, latents: mlx.mlx_array, s: S) !mlx.mlx_array {
+        const w = &self.w;
+        const b = mlx.getShape(latents)[0];
+        const t_lat = mlx.getShape(latents)[2];
+
+        const rs = w.get("running_std") orelse return error.MissingWeight;
+        const xs = try mulA(latents, rs, s);
+        defer _ = mlx.mlx_array_free(xs);
+        const xt = try transposeA(xs, &[_]c_int{ 0, 2, 1 }, s);
+        defer _ = mlx.mlx_array_free(xt);
+        const xp = try lin(w, alloc, xt, "project_in", s);
+        defer _ = mlx.mlx_array_free(xp);
+
+        // latent slot + 16 broadcast learnable tokens → [B, T, 17, E]
+        var xe = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_expand_dims(&xe, xp, 2, s));
+        defer _ = mlx.mlx_array_free(xe);
+        const nt = w.get("new_tokens") orelse return error.MissingWeight;
+        var nt0 = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_expand_dims(&nt0, nt, 0, s));
+        defer _ = mlx.mlx_array_free(nt0);
+        const nsh = [4]c_int{ b, t_lat, 16, SameL.DIM };
+        var ntb = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_broadcast_to(&ntb, nt0, &nsh, 4, s));
+        defer _ = mlx.mlx_array_free(ntb);
+        const cat = try concatMany(&.{ xe, ntb }, 2, s);
+        defer _ = mlx.mlx_array_free(cat);
+        const esh = [3]c_int{ b, t_lat * SameL.SUB_CHUNK, SameL.DIM };
+        var cur = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_reshape(&cur, cat, &esh, 3, s));
+
+        // 12 residual blocks (explicit frees: cur is reassigned each step)
+        for (0..SameL.BLOCKS) |i| {
+            const pnp = try std.fmt.allocPrint(alloc, "blocks.{d}.pre_norm", .{i});
+            defer alloc.free(pnp);
+            const hn = try dyt(alloc, w, pnp, cur, s);
+            defer _ = mlx.mlx_array_free(hn);
+            const att = try decAttn(alloc, w, hn, i, self.swa_mask, s);
+            defer _ = mlx.mlx_array_free(att);
+            const after_att = try addA(cur, att, s);
+            _ = mlx.mlx_array_free(cur);
+            cur = after_att;
+
+            const fnp = try std.fmt.allocPrint(alloc, "blocks.{d}.ff_norm", .{i});
+            defer alloc.free(fnp);
+            const fnorm = try dyt(alloc, w, fnp, cur, s);
+            defer _ = mlx.mlx_array_free(fnorm);
+            const ff = try decFF(alloc, w, fnorm, i, s);
+            defer _ = mlx.mlx_array_free(ff);
+            const after_ff = try addA(cur, ff, s);
+            _ = mlx.mlx_array_free(cur);
+            cur = after_ff;
+        }
+
+        // drop index 0 of each 17-group → [B, T, 16, E] → [B, T*16, E]
+        const gsh = [4]c_int{ b, t_lat, SameL.SUB_CHUNK, SameL.DIM };
+        var r4 = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_reshape(&r4, cur, &gsh, 4, s));
+        _ = mlx.mlx_array_free(cur);
+        defer _ = mlx.mlx_array_free(r4);
+        const lo = [4]c_int{ 0, 0, 1, 0 };
+        const hi = [4]c_int{ b, t_lat, SameL.SUB_CHUNK, SameL.DIM };
+        const stp = [4]c_int{ 1, 1, 1, 1 };
+        var sl = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_slice(&sl, r4, &lo, 4, &hi, 4, &stp, 4, s));
+        defer _ = mlx.mlx_array_free(sl);
+        const fsh = [3]c_int{ b, t_lat * (SameL.SUB_CHUNK - 1), SameL.DIM };
+        var flat = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_reshape(&flat, sl, &fsh, 3, s));
+        defer _ = mlx.mlx_array_free(flat);
+
+        // mapping: Conv1d k=1 stored [512, 1536, 1] → Linear [512, 1536]
+        const mw = w.get("mapping.weight") orelse return error.MissingWeight;
+        const mwrsh = [2]c_int{ SameL.OUT_CH, SameL.DIM };
+        var mwr = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_reshape(&mwr, mw, &mwrsh, 2, s));
+        defer _ = mlx.mlx_array_free(mwr);
+        const mwt = try transposeA(mwr, &[_]c_int{ 1, 0 }, s);
+        defer _ = mlx.mlx_array_free(mwt);
+        var mo = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_matmul(&mo, flat, mwt, s));
+        defer _ = mlx.mlx_array_free(mo);
+        const mb = w.get("mapping.bias") orelse return error.MissingWeight;
+        const mob = try addA(mo, mb, s);
+        defer _ = mlx.mlx_array_free(mob);
+        return transposeA(mob, &[_]c_int{ 0, 2, 1 }, s);
+    }
+
+    /// Reference `decode_chunked`: windows of `chunk + 2*ovl` latents with
+    /// `ovl` valid on each side (edges take only their in-bounds valid part),
+    /// results concatenated on the patch axis. `T <= kernel` → one direct call.
+    pub fn decodeChunked(self: *SameLDecoder, alloc: std.mem.Allocator, latents: mlx.mlx_array, chunk: usize, ovl: usize, s: S) !mlx.mlx_array {
+        const t: usize = @intCast(mlx.getShape(latents)[2]);
+        const kernel = chunk + 2 * ovl;
+        if (t <= kernel) return self.decode(alloc, latents, s);
+
+        // count pieces: first + interiors + possible last
+        var i = chunk + ovl;
+        var interiors: usize = 0;
+        while (i + chunk + ovl <= t) : (i += chunk) {
+            interiors += 1;
+        }
+        const remaining = t - i;
+        const count = 1 + interiors + (if (remaining > 0) @as(usize, 1) else 0);
+        const pieces = try alloc.alloc(mlx.mlx_array, count);
+        defer alloc.free(pieces);
+        var n: usize = 0;
+
+        // first window: [0, kernel) → first (chunk+ovl)*16 patches
+        {
+            const kw = try sliceAxis2(latents, 0, @intCast(kernel), s);
+            defer _ = mlx.mlx_array_free(kw);
+            const o = try self.decode(alloc, kw, s);
+            defer _ = mlx.mlx_array_free(o);
+            pieces[n] = try sliceAxis2(o, 0, @intCast((chunk + ovl) * 16), s);
+            n += 1;
+        }
+        // interiors: valid [ovl, chunk+ovl)*16 per window
+        i = chunk + ovl;
+        while (i + chunk + ovl <= t) : (i += chunk) {
+            const kw = try sliceAxis2(latents, @intCast(i - ovl), @intCast(i + chunk + ovl), s);
+            defer _ = mlx.mlx_array_free(kw);
+            const o = try self.decode(alloc, kw, s);
+            defer _ = mlx.mlx_array_free(o);
+            pieces[n] = try sliceAxis2(o, @intCast(ovl * 16), @intCast((ovl + chunk) * 16), s);
+            n += 1;
+        }
+        // last: [t-kernel, t) → last remaining*16 patches
+        if (remaining > 0) {
+            const kw = try sliceAxis2(latents, @intCast(t - kernel), @intCast(t), s);
+            defer _ = mlx.mlx_array_free(kw);
+            const o = try self.decode(alloc, kw, s);
+            defer _ = mlx.mlx_array_free(o);
+            const start: c_int = @intCast((kernel - remaining) * 16);
+            const end: c_int = @intCast(kernel * 16);
+            pieces[n] = try sliceAxis2(o, start, end, s);
+            n += 1;
+        }
+        const out = try concatMany(pieces[0..n], 2, s);
+        for (pieces[0..n]) |pi| _ = mlx.mlx_array_free(pi);
+        return out;
+    }
+};
+
+// ── SAME-L decoder oracle ───────────────────────────────────────────────────
+
+test "stable_audio3 oracle: SAME-L decoder arms match reference" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const dir = try sa3ModelDir();
+    const fix = try fixturesDir();
+    const st = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(st);
+
+    const lat_raw = try readRawF32(io, a, fix, "latents_step08.f32.raw");
+    defer a.free(lat_raw);
+    const lat_32 = mlx.mlx_array_new_data(lat_raw.ptr, &[_]c_int{ 1, 256, 162 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(lat_32);
+
+    var dec = try SameLDecoder.load(io, a, dir);
+    defer dec.deinit();
+
+    // ── production arm: chunked(128, 8) at T_lat=162 ──
+    const patches = try dec.decodeChunked(a, lat_32, 128, 8, st);
+    defer _ = mlx.mlx_array_free(patches);
+    const ref_p = try readRawF32(io, a, fix, "patches_T162.f32.raw");
+    defer a.free(ref_p);
+    try assertParity(patches, ref_p, "patches T162", 0.999, 0.01, st);
+
+    // ── patched_decode → audio, trimmed to 15 s ──
+    const audio_full = try patchedDecode(a, patches, st);
+    defer _ = mlx.mlx_array_free(audio_full);
+    const lo = [_]c_int{ 0, 0, 0 };
+    const hi = [_]c_int{ 1, 2, 661500 };
+    const stp = [_]c_int{ 1, 1, 1 };
+    var audio = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_slice(&audio, audio_full, &lo, 3, &hi, 3, &stp, 3, st));
+    defer _ = mlx.mlx_array_free(audio);
+    const ref_a = try readRawF32(io, a, fix, "audio_T162.f32.raw");
+    defer a.free(ref_a);
+    try assertParity(audio, ref_a, "audio T162", 0.999, 0.01, st);
+
+    // ── short arms: direct even T=8, chunked(2, 2) odd T=7 ──
+    const l8 = try sliceAxis2(lat_32, 0, 8, st);
+    defer _ = mlx.mlx_array_free(l8);
+    const p8 = try dec.decode(a, l8, st);
+    defer _ = mlx.mlx_array_free(p8);
+    const ref8 = try readRawF32(io, a, fix, "patches_T8_direct.f32.raw");
+    defer a.free(ref8);
+    try assertParity(p8, ref8, "patches T8", 0.999, 0.01, st);
+
+    const l7 = try sliceAxis2(lat_32, 0, 7, st);
+    defer _ = mlx.mlx_array_free(l7);
+    const p7 = try dec.decodeChunked(a, l7, 2, 2, st);
+    defer _ = mlx.mlx_array_free(p7);
+    const ref7 = try readRawF32(io, a, fix, "patches_T7_chunk2.f32.raw");
+    defer a.free(ref7);
+    try assertParity(p7, ref7, "patches T7", 0.999, 0.01, st);
+}
+
+/// `x[..., lo:hi]` on axis 2 (latent/time); input `[1, C, T]`.
+fn sliceAxis2(x: mlx.mlx_array, lo: c_int, hi: c_int, s: S) !mlx.mlx_array {
+    const sh = mlx.getShape(x);
+    const l = [_]c_int{ 0, 0, lo };
+    const h = [_]c_int{ sh[0], sh[1], hi };
+    const stp = [_]c_int{ 1, 1, 1 };
+    var o = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_slice(&o, x, &l, 3, &h, 3, &stp, 3, s));
+    return o;
 }
