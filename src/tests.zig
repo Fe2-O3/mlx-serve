@@ -84,6 +84,7 @@ test {
     _ = @import("hunyuan3d.zig");
     _ = @import("acestep.zig");
     _ = @import("music3.zig");
+    _ = @import("stable_audio3.zig");
     _ = @import("uvwrap.zig");
     _ = @import("hunyuan3d_paint.zig");
     _ = @import("hunyuan3d_paint_unet.zig");
