@@ -32,6 +32,9 @@ const testing = std.testing;
 const tok_mod = @import("tokenizer.zig");
 const mlx = @import("mlx.zig");
 const model_mod = @import("model.zig");
+const sse = @import("gen_sse.zig");
+const wav_mod = @import("wav.zig");
+const log = @import("log.zig");
 
 const S = mlx.mlx_stream;
 const Weights = model_mod.Weights;
@@ -288,6 +291,17 @@ fn addScalar(x: mlx.mlx_array, v: f32, s: S) !mlx.mlx_array {
     return addA(x, c, s);
 }
 
+/// x / scalar — a DIVISION, not a reciprocal-multiply: `x * f16(1/c)` and
+/// `x / c` differ by up to ~1 ulp (f16(1/c) carries a +2e-4 bias), and the
+/// reference softcap path really divides (`qk / softcap`).
+fn divScalar(x: mlx.mlx_array, v: f32, s: S) !mlx.mlx_array {
+    const c = try scalarLike(x, v, s);
+    defer _ = mlx.mlx_array_free(c);
+    var o = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_divide(&o, x, c, s));
+    return o;
+}
+
 fn tanhA(x: mlx.mlx_array, s: S) !mlx.mlx_array {
     var o = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_tanh(&o, x, s));
@@ -373,9 +387,14 @@ fn lin(w: *const Weights, a: std.mem.Allocator, x: mlx.mlx_array, prefix: []cons
 /// gelu_approx: 0.5x(1 + tanh(sqrt(2/pi)(x + 0.044715 x^3))) — every
 /// constant materialized in x's dtype (weak-scalar rule), f16 like MLX.
 fn geluApprox(x: mlx.mlx_array, s: S) !mlx.mlx_array {
-    const x2 = try mulA(x, x, s);
-    defer _ = mlx.mlx_array_free(x2);
-    const x3 = try mulA(x2, x, s);
+    // x³ via mlx power — the reference is Python `0.044715 * x ** 3`, and
+    // MLX computes integer pow in f32, rounding ONCE. Hand-rolled x*x*x
+    // rounds twice in f16 and disagrees on ~24% of elements (up to 2 ulps of
+    // x³) — enough for the 12-layer stack to drift to mean 0.002.
+    const three = mlx.mlx_array_new_int(3);
+    defer _ = mlx.mlx_array_free(three);
+    var x3 = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_power(&x3, x, three, s));
     defer _ = mlx.mlx_array_free(x3);
     const t = try mulScalar(x3, 0.044715, s);
     defer _ = mlx.mlx_array_free(t);
@@ -524,7 +543,7 @@ fn selfAttention(
     }
     {
         const cap = cfg.attn_logit_softcapping;
-        const d = try mulScalar(qk, 1.0 / cap, s);
+        const d = try divScalar(qk, cap, s);
         _ = mlx.mlx_array_free(qk);
         const th = try tanhA(d, s);
         _ = mlx.mlx_array_free(d);
@@ -2488,4 +2507,326 @@ fn sliceAxis2(x: mlx.mlx_array, lo: c_int, hi: c_int, s: S) !mlx.mlx_array {
     var o = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_slice(&o, x, &l, 3, &h, 3, &stp, 3, s));
     return o;
+}
+
+// ── engine: pack → WAV (reference = sa3_mlx.py generate) ────────────────────
+
+pub const GenerateRequest = struct {
+    prompt: []const u8,
+    seconds: f32 = 30.0,
+    steps: u32 = 8,
+    seed: u64 = 42,
+};
+
+pub const Generated = struct {
+    /// Planar [ch0 | ch1] f32 in [-1, 1], trimmed to round(seconds * 44100).
+    samples: []f32,
+    channels: u16 = 2,
+    sample_rate: u32 = 44100,
+};
+
+pub const Engine = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    s: S,
+    tok: tok_mod.Tokenizer,
+    t5: T5Gemma,
+    dit: Dit,
+    dec: SameLDecoder,
+
+    pub fn load(io: std.Io, a: std.mem.Allocator, model_dir: []const u8) !*Engine {
+        const self = try a.create(Engine);
+        errdefer a.destroy(self);
+        self.allocator = a;
+        self.io = io;
+        self.s = mlx.mlx_default_gpu_stream_new();
+        errdefer _ = mlx.mlx_stream_free(self.s);
+        self.tok = try tok_mod.loadTokenizer(io, a, model_dir);
+        errdefer self.tok.deinit();
+        self.t5 = try T5Gemma.load(io, a, model_dir);
+        errdefer self.t5.deinit();
+        self.dit = try Dit.load(io, a, model_dir);
+        errdefer self.dit.deinit();
+        self.dec = try SameLDecoder.load(io, a, model_dir);
+        errdefer self.dec.deinit();
+        log.info("[sa3] engine ready (t5 {d} + dit {d} + decoder {d} tensors)\n", .{
+            self.t5.w.count(),
+            self.dit.w.count(),
+            self.dec.w.count(),
+        });
+        return self;
+    }
+
+    pub fn deinit(self: *Engine) void {
+        self.dec.deinit();
+        self.dit.deinit();
+        self.t5.deinit();
+        self.tok.deinit();
+        _ = mlx.mlx_stream_free(self.s);
+        self.allocator.destroy(self);
+    }
+
+    /// Full pipeline: tokenize → T5Gemma → condition → seeded noise →
+    /// ping-pong sampler → SAME-L decode → trim. Noise comes from the same
+    /// MLX RNG as the reference (`key(seed)`, then `split` per redraw), so a
+    /// prompt/seconds/steps/seed tuple reproduces the reference latent.
+    pub fn generate(self: *Engine, allocator: std.mem.Allocator, req: GenerateRequest, progress: ?sse.Progress) !Generated {
+        const seconds = std.math.clamp(@as(f64, req.seconds), 1.0, 384.0);
+        const steps: usize = if (req.steps == 0) 8 else @intCast(req.steps);
+
+        // tokenize; the reference truncates at prompt_max_len (256)
+        const ids_full = try self.tok.encode(allocator, req.prompt);
+        defer allocator.free(ids_full);
+        const n_ids = @min(ids_full.len, 256);
+        const ids = try allocator.alloc(i32, n_ids);
+        defer allocator.free(ids);
+        for (ids_full[0..n_ids], ids) |u, *i| i.* = @intCast(u);
+        var mask: [256]i32 = @splat(0);
+        for (0..n_ids) |i| mask[i] = 1;
+
+        if (progress) |p| p.emit("condition", 0, 3);
+        const hidden = try self.t5.encode(allocator, ids, mask[0..], self.t5.s);
+        defer _ = mlx.mlx_array_free(hidden);
+        const h16 = try astype(hidden, .float16, self.s);
+        defer _ = mlx.mlx_array_free(h16);
+        const cond = try conditionPrompt(&self.dit.w, h16, mask[0..], @floatCast(seconds), self.s);
+        defer cond.deinit();
+
+        // T_lat = ceil(seconds * 44100 / 4096) — decoder-independent
+        const t_lat_raw: usize = @intFromFloat(@ceil(seconds * 44100.0 / 4096.0));
+        const t_lat: usize = @max(1, t_lat_raw);
+
+        // initial noise: mx.random.normal((1,256,T_lat), f16, key(seed))
+        if (progress) |p| p.emit("sample", 0, @intCast(steps));
+        var k0 = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_random_key(&k0, req.seed));
+        defer _ = mlx.mlx_array_free(k0);
+        const nsh = [3]c_int{ 1, 256, @intCast(t_lat) };
+        var x0 = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_random_normal(&x0, &nsh, 3, .float16, 0.0, 1.0, k0, self.s));
+        defer _ = mlx.mlx_array_free(x0);
+
+        const sigmas = try buildPingpongSchedule(allocator, steps, 1.0);
+        defer allocator.free(sigmas);
+
+        // redraws: (key, sub) = split(key); draw sub at every step with
+        // t_next > 0 before the last — dtype follows x (f16 at step 0, f32
+        // after the first update widens it).
+        var n_draw: usize = 0;
+        for (0..steps) |i| {
+            if (i < steps - 1 and sigmas[i + 1] > 0.0) n_draw += 1;
+        }
+        const noises = try allocator.alloc(mlx.mlx_array, n_draw);
+        defer {
+            for (noises) |nz| _ = mlx.mlx_array_free(nz);
+            allocator.free(noises);
+        }
+        // the reference seeds the redraw chain with seed + 1 (sa3_mlx:
+        // `sample_flow_pingpong(..., seed=args.seed + 1)`) while x0 above
+        // uses `seed` directly.
+        // ks ownership rides key_owned: the first split frees it, or the
+        // end-of-loop free does when no redraw happened.
+        var ks = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_random_key(&ks, req.seed + 1));
+        var key_cur = ks;
+        var key_owned = true;
+        var di: usize = 0;
+        for (0..steps) |i| {
+            if (!(i < steps - 1 and sigmas[i + 1] > 0.0)) continue;
+            var kn = mlx.mlx_array_new();
+            var sub = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_random_split(&kn, &sub, key_cur, self.s));
+            if (key_owned) _ = mlx.mlx_array_free(key_cur);
+            key_cur = kn;
+            key_owned = true;
+            const dt: mlx.mlx_dtype = if (i == 0) .float16 else .float32;
+            var nz = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_random_normal(&nz, &nsh, 3, dt, 0.0, 1.0, sub, self.s));
+            _ = mlx.mlx_array_free(sub);
+            noises[di] = nz;
+            di += 1;
+        }
+        if (key_owned) _ = mlx.mlx_array_free(key_cur);
+
+        const lats = try samplePingPong(allocator, &self.dit, x0, sigmas, noises, cond.cross, cond.global_cond, self.s);
+        defer {
+            for (lats) |l| _ = mlx.mlx_array_free(l);
+            allocator.free(lats);
+        }
+        if (progress) |p| p.emit("sample", @intCast(steps), @intCast(steps));
+
+        // decode dispatch (sa3_mlx): >144 chunked(128,8); even direct;
+        // odd >6 chunked(2,2); tiny odd reflect-pad one latent then trim.
+        if (progress) |p| p.emit("decode", 0, 1);
+        const lat = lats[steps - 1];
+        var patches: mlx.mlx_array = undefined;
+        if (t_lat > 144) {
+            patches = try self.dec.decodeChunked(allocator, lat, 128, 8, self.s);
+        } else if (@mod(t_lat, 2) == 0) {
+            patches = try self.dec.decode(allocator, lat, self.s);
+        } else if (t_lat > 6) {
+            patches = try self.dec.decodeChunked(allocator, lat, 2, 2, self.s);
+        } else {
+            const llo = [_]c_int{ 0, 0, @intCast(t_lat - 1) };
+            const lhi = [_]c_int{ 1, 256, @intCast(t_lat) };
+            const lst = [_]c_int{ 1, 1, 1 };
+            var last = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_slice(&last, lat, &llo, 3, &lhi, 3, &lst, 3, self.s));
+            defer _ = mlx.mlx_array_free(last);
+            const pe = try concatA(lat, last, 2, self.s);
+            defer _ = mlx.mlx_array_free(pe);
+            const pd = try self.dec.decode(allocator, pe, self.s);
+            defer _ = mlx.mlx_array_free(pd);
+            const thi = [_]c_int{ 1, 512, @intCast(t_lat * 16) };
+            const tlo = [_]c_int{ 0, 0, 0 };
+            const tst = [_]c_int{ 1, 1, 1 };
+            patches = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_slice(&patches, pd, &tlo, 3, &thi, 3, &tst, 3, self.s));
+        }
+        defer _ = mlx.mlx_array_free(patches);
+
+        const audio_full = try patchedDecode(allocator, patches, self.s);
+        defer _ = mlx.mlx_array_free(audio_full);
+        const want: usize = @intFromFloat(@round(seconds * 44100.0));
+        const full: usize = t_lat * 4096;
+        var trimmed = audio_full;
+        if (want < full) {
+            const alo = [_]c_int{ 0, 0, 0 };
+            const ahi = [_]c_int{ 1, 2, @intCast(want) };
+            const ast = [_]c_int{ 1, 1, 1 };
+            trimmed = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_slice(&trimmed, audio_full, &alo, 3, &ahi, 3, &ast, 3, self.s));
+        }
+        defer if (trimmed.ctx != audio_full.ctx) {
+            _ = mlx.mlx_array_free(trimmed);
+        };
+
+        var ct = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_contiguous(&ct, trimmed, false, self.s));
+        defer _ = mlx.mlx_array_free(ct);
+        evalA(ct);
+        const data = mlx.mlx_array_data_float32(ct) orelse return error.NoAudioData;
+        const out = try allocator.alloc(f32, want * 2);
+        @memcpy(out, data[0 .. want * 2]);
+        if (progress) |p| p.emit("decode", 1, 1);
+        return .{ .samples = out };
+    }
+
+    /// `generate` + WAV bytes (PCM16, stereo interleaved) for the HTTP route.
+    pub fn generateWav(self: *Engine, allocator: std.mem.Allocator, req: GenerateRequest, progress: ?sse.Progress) ![]u8 {
+        const g = try self.generate(allocator, req, progress);
+        defer allocator.free(g.samples);
+        const n = g.samples.len / 2;
+        const inter = try allocator.alloc(f32, g.samples.len);
+        defer allocator.free(inter);
+        for (0..n) |i| {
+            inter[2 * i] = g.samples[i];
+            inter[2 * i + 1] = g.samples[n + i];
+        }
+        return wav_mod.encodePcm16(allocator, inter, g.sample_rate, g.channels);
+    }
+};
+
+// ── end-to-end oracle ────────────────────────────────────────────────────────
+
+/// Test-only: dequantize every affine-quantized tensor of `w` in place, so an
+/// oracle compares against the dequantized-fixture reference WITHOUT the
+/// quantizer in the loop (the dump's own rule: fixtures measure the port).
+/// Weights are cast to f16 exactly like the fixture npz; `.scales`/`.biases`
+/// are dropped so `lin()` takes its dense branch. Production stays quantized.
+fn dequantizeForTest(w: *Weights, s: S) !void {
+    const a = w.allocator;
+    var deq_count: u32 = 0;
+    var prefixes: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (prefixes.items) |p| a.free(p);
+        prefixes.deinit(a);
+    }
+    {
+        var it = w.map.keyIterator();
+        while (it.next()) |k| {
+            const key = k.*;
+            const suffix = ".scales";
+            if (std.mem.endsWith(u8, key, suffix)) {
+                try prefixes.append(a, try a.dupe(u8, key[0 .. key.len - suffix.len]));
+            }
+        }
+    }
+    for (prefixes.items) |prefix| {
+        deq_count += 1;
+        const wk = try std.fmt.allocPrint(a, "{s}.weight", .{prefix});
+        defer a.free(wk);
+        const sk = try std.fmt.allocPrint(a, "{s}.scales", .{prefix});
+        defer a.free(sk);
+        const bk = try std.fmt.allocPrint(a, "{s}.biases", .{prefix});
+        defer a.free(bk);
+        const wq = try getW(w, wk);
+        const sc = try getW(w, sk);
+        const bi = try getW(w, bk);
+        // group-64 8-bit affine (converter GROUP_SIZE, config bits) — solved
+        // from geometry like lin(), but asserted: a different pack contract
+        // must fail loud, not dequantize silently wrong.
+        const s_cols: u32 = @intCast(mlx.getShape(sc)[1]);
+        const in_features: u32 = 64 * s_cols;
+        const w_cols: u32 = @intCast(mlx.getShape(wq)[1]);
+        const bits: u32 = @divExact(32 * w_cols, in_features);
+        if (bits != 8) return error.UnexpectedQuantBits;
+        var dense = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_dequantize(&dense, wq, sc, bi, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(8), "affine", .{}, mlx.mlx_optional_dtype{}, s));
+        var f16a = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_astype(&f16a, dense, .float16, s));
+        _ = mlx.mlx_array_free(dense);
+        const cell = w.map.getPtr(wk) orelse return error.MissingWeight;
+        _ = mlx.mlx_array_free(cell.*);
+        cell.* = f16a;
+        if (w.map.fetchRemove(sk)) |kv| {
+            _ = mlx.mlx_array_free(kv.value);
+            a.free(kv.key);
+        }
+        if (w.map.fetchRemove(bk)) |kv| {
+            _ = mlx.mlx_array_free(kv.value);
+            a.free(kv.key);
+        }
+    }
+    std.debug.print("[sa3-dequant] {d} tensors\n", .{deq_count});
+}
+
+
+test "stable_audio3 oracle: end-to-end generation matches reference audio" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const dir = try sa3ModelDir();
+    const fix = try fixturesDir();
+    const st = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(st);
+
+    var eng = try Engine.load(io, a, dir);
+    defer eng.deinit();
+    // Fixtures are dumped from DEQUANTIZED pack weights ("measure the port,
+    // not the quantizer"), so this oracle dequantizes in place as well: the
+    // 8 sampler steps amplify per-stage noise (quantizer or otherwise) roughly
+    // 100×, which would swamp this oracle's signal. The stage oracles above
+    // keep exercising the quantized production path.
+    try dequantizeForTest(&eng.t5.w, st);
+    try dequantizeForTest(&eng.dit.w, st);
+
+    const out = try eng.generate(a, .{
+        .prompt = "A beautiful piano arpeggio grows into a cinematic climax",
+        .seconds = 15.0,
+        .steps = 8,
+        .seed = 1234,
+    }, null);
+    defer a.free(out.samples);
+
+    const ref = try readRawF32(io, a, fix, "audio_T162.f32.raw");
+    defer a.free(ref);
+    const want: usize = 661500; // 15 s * 44100, same trim the reference applies
+    try testing.expectEqual(@as(usize, want * 2), out.samples.len);
+
+    // out.samples is planar [ch0 | ch1], the fixture's own layout.
+    const sh = [_]c_int{ 1, 2, @intCast(want) };
+    const arr = mlx.mlx_array_new_data(out.samples.ptr, &sh, 3, .float32);
+    defer _ = mlx.mlx_array_free(arr);
+    try assertParity(arr, ref, "e2e audio", 0.99, 0.05, st);
 }
