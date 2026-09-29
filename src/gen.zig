@@ -23,6 +23,7 @@ const lora_mod = @import("lora.zig");
 const tts = @import("tts.zig");
 const acestep = @import("acestep.zig");
 const music3 = @import("music3.zig");
+const stable_audio3 = @import("stable_audio3.zig");
 const kokoro = @import("kokoro.zig");
 const laya = @import("laya.zig");
 const ltx = @import("ltx_video.zig");
@@ -101,6 +102,7 @@ pub const media_model_types = [_][]const u8{
     "flux2",     "krea",       "mage_flow",      "mageflow",
     "qwen3_tts", "acestep",    "kokoro",         "AudioVideo",
     "hunyuan3d", "minimax_h3", "minimax_music3", "qwen_image", "laya",
+    "stable_audio3",
 };
 
 pub fn modalityFromType(model_type: []const u8) ?Modality {
@@ -111,6 +113,7 @@ pub fn modalityFromType(model_type: []const u8) ?Modality {
     if (std.mem.eql(u8, model_type, "qwen3_tts")) return .audio;
     if (std.mem.eql(u8, model_type, "acestep")) return .audio;
     if (std.mem.eql(u8, model_type, "minimax_music3")) return .audio;
+    if (std.mem.eql(u8, model_type, "stable_audio3")) return .audio;
     if (std.mem.eql(u8, model_type, "kokoro")) return .audio;
     if (std.mem.eql(u8, model_type, "AudioVideo")) return .video;
     if (std.mem.eql(u8, model_type, "minimax_h3")) return .video;
@@ -146,6 +149,7 @@ pub const GenRoute = enum {
 pub fn audioBackendKindForType(model_type: []const u8) AudioBackendKind {
     if (std.mem.eql(u8, model_type, "acestep")) return .music;
     if (std.mem.eql(u8, model_type, "minimax_music3")) return .music3;
+    if (std.mem.eql(u8, model_type, "stable_audio3")) return .stable_audio3;
     if (std.mem.eql(u8, model_type, "kokoro")) return .kokoro;
     return .tts;
 }
@@ -159,12 +163,13 @@ pub const AudioBackendKind = enum {
     tts,
     music,
     music3,
+    stable_audio3,
     kokoro,
 
     /// Music-generation backends serve /v1/audio/music-generations and
     /// advertise "music" beside "audio"; the TTS arms never do.
     pub fn servesMusic(self: AudioBackendKind) bool {
-        return self == .music or self == .music3;
+        return self == .music or self == .music3 or self == .stable_audio3;
     }
 };
 
@@ -851,6 +856,7 @@ pub const AudioBackend = union(enum) {
     tts: tts.Synthesizer,
     music: *acestep.Engine,
     music3: *music3.Engine,
+    stable_audio3: *stable_audio3.Engine,
     kokoro: *kokoro.Engine,
 };
 
@@ -877,6 +883,11 @@ pub const AudioEngine = struct {
             log.info("[audio] MiniMax Music 3 engine ready\n", .{});
             return self;
         }
+        if (mt != null and audioBackendKindForType(mt.?) == .stable_audio3) {
+            self.backend = .{ .stable_audio3 = try stable_audio3.Engine.load(io, allocator, model_dir) };
+            log.info("[audio] Stable Audio 3 engine ready\n", .{});
+            return self;
+        }
         if (mt != null and audioBackendKindForType(mt.?) == .kokoro) {
             const ks = mlx.mlx_default_gpu_stream_new();
             self.backend = .{ .kokoro = try kokoro.Engine.load(io, allocator, model_dir, ks) };
@@ -894,6 +905,7 @@ pub const AudioEngine = struct {
             .tts => |*synth| synth.deinit(),
             .music => |e| e.deinit(),
             .music3 => |e| e.deinit(),
+            .stable_audio3 => |e| e.deinit(),
             .kokoro => |e| e.deinit(),
         }
         self.allocator.destroy(self);
@@ -2457,7 +2469,7 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
 pub fn handleAudio(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *AudioEngine) !void {
     const synth = switch (engine.backend) {
         .tts => |*t| t,
-        .music, .music3 => return sendError(conn, 400, "loaded audio model is a music generator; POST /v1/audio/music-generations"),
+        .music, .music3, .stable_audio3 => return sendError(conn, 400, "loaded audio model is a music generator; POST /v1/audio/music-generations"),
         .kokoro => |k| return handleKokoroSpeech(allocator, conn, body, k),
     };
     // Pre-warm (docs/qwentts-cache.md): `{"warm_only":true,"ref_audio":...}`
@@ -2652,6 +2664,7 @@ pub fn handleMusic(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     switch (engine.backend) {
         .music => |m| return handleMusicAcestep(allocator, conn, body, m),
         .music3 => |m| return handleMusic3(allocator, conn, body, m),
+        .stable_audio3 => |m| return handleMusicSa3(allocator, conn, body, m),
         .tts, .kokoro => return sendError(conn, 400, "loaded audio model is a TTS voice; POST /v1/audio/speech"),
     }
 }
@@ -2951,6 +2964,76 @@ fn handleMusic3(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, m3:
     };
     defer allocator.free(wav);
     log.info("[music3] -> {d} WAV bytes\n", .{wav.len});
+    if (want_stream) {
+        const b64_len = std.base64.standard.Encoder.calcSize(wav.len);
+        const b64 = try allocator.alloc(u8, b64_len);
+        defer allocator.free(b64);
+        _ = std.base64.standard.Encoder.encode(b64, wav);
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(allocator);
+        try out.appendSlice(allocator, "data: {\"type\":\"complete\",\"format\":\"wav\",\"data\":\"");
+        try out.appendSlice(allocator, b64);
+        try out.appendSlice(allocator, "\"}\n\n");
+        try conn.writeAll(out.items);
+        return;
+    }
+    return sendBytes(conn, allocator, "audio/wav", wav);
+}
+
+/// POST /v1/audio/music-generations on the Stable Audio 3 backend — pure
+/// text-to-audio: `{prompt, duration_seconds, steps, seed, stream}`. Every
+/// knob the other music engines condition on (lyrics/instrumental, bpm/
+/// keyscale, reference/cover audio, task) is a named 400 pointing at
+/// 'prompt' — SA3 has no conditioning path for them, and a silent drop
+/// would let the request "succeed" while ignoring what was asked. Response
+/// mirrors the family: raw `audio/wav` non-stream; SSE `progress` per
+/// stage/step + base64 `complete` when streaming.
+fn handleMusicSa3(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, sa: *stable_audio3.Engine) !void {
+    for ([_][]const u8{ "lyrics", "instrumental", "bpm", "keyscale", "ref_audio", "src_audio", "task", "timesignature", "vocal_language" }) |field| {
+        if (jsonHasKey(body, field)) {
+            var msg: [192]u8 = undefined;
+            const m = std.fmt.bufPrint(&msg, "'{s}' is an ACE-Step / MiniMax Music 3 field; Stable Audio 3 is text-to-audio — describe it in 'prompt'", .{field}) catch "unsupported field";
+            return sendError(conn, 400, m);
+        }
+    }
+    const raw_prompt = extractJsonString(body, "prompt") orelse return sendError(conn, 400, "missing 'prompt' (text description of the sound)");
+    const prompt = try jsonUnescape(allocator, raw_prompt);
+    defer allocator.free(prompt);
+    if (prompt.len == 0) return sendError(conn, 400, "empty 'prompt'");
+
+    const duration: u32 = @intCast(extractJsonInt(body, "duration_seconds") orelse 30);
+    if (duration < stable_audio3.MIN_DURATION_S or duration > stable_audio3.MAX_DURATION_S)
+        return sendError(conn, 400, "'duration_seconds' must be in [1,384]");
+    const steps: u32 = @intCast(extractJsonInt(body, "steps") orelse stable_audio3.DEFAULT_STEPS);
+    if (steps < 1 or steps > stable_audio3.MAX_STEPS) return sendError(conn, 400, "'steps' must be in [1,100]");
+    const seed: u64 = extractJsonInt(body, "seed") orelse 42;
+
+    const want_stream = sse.bodyWantsTrue(body, "stream");
+    log.info("[sa3] generating {d}s steps={d} seed={d} stream={}\n", .{ duration, steps, seed, want_stream });
+    var sctx = sse.StreamCtx{ .conn = conn, .stream = want_stream };
+    const prog: ?sse.Progress = sctx.progress();
+    if (want_stream) try conn.writeAll(sse.headers);
+
+    const req = stable_audio3.GenerateRequest{
+        .prompt = prompt,
+        .seconds = @floatFromInt(duration),
+        .steps = steps,
+        .seed = seed,
+    };
+    const wav = sa.generateWav(allocator, req, prog) catch |err| {
+        if (err == error.Cancelled) {
+            log.info("[sa3] generation cancelled by client\n", .{});
+            return;
+        }
+        log.err("[sa3] generation failed: {}\n", .{err});
+        if (want_stream) {
+            sse.sendError(conn, "music generation failed");
+            return;
+        }
+        return sendError(conn, 500, "music generation failed");
+    };
+    defer allocator.free(wav);
+    log.info("[sa3] -> {d} WAV bytes\n", .{wav.len});
     if (want_stream) {
         const b64_len = std.base64.standard.Encoder.calcSize(wav.len);
         const b64 = try allocator.alloc(u8, b64_len);
@@ -4511,6 +4594,17 @@ fn sendError(conn: *Conn, code: u16, msg: []const u8) !void {
 
 // ── Minimal JSON parsing helpers (top-level keys only) ──
 
+/// True when `body` carries the JSON key `"key"` at all, whatever its value
+/// type. The extractJson{String,Int,Float} family only fires for its own
+/// type, so a presence check built from them silently misses bools
+/// (`"instrumental": true`) — exactly what a "refuse, never ignore" field
+/// check must not do.
+fn jsonHasKey(body: []const u8, key: []const u8) bool {
+    var key_pat_buf: [64]u8 = undefined;
+    const key_pat = std.fmt.bufPrint(&key_pat_buf, "\"{s}\"", .{key}) catch return false;
+    return std.mem.indexOf(u8, body, key_pat) != null;
+}
+
 fn extractJsonString(body: []const u8, key: []const u8) ?[]const u8 {
     var key_pat_buf: [64]u8 = undefined;
     const key_pat = std.fmt.bufPrint(&key_pat_buf, "\"{s}\"", .{key}) catch return null;
@@ -5191,12 +5285,14 @@ test "GenRoute: speech + music share the audio modality slot" {
 test "audioBackendKindForType routes acestep to music, everything else to tts" {
     try testing.expect(audioBackendKindForType("acestep") == .music);
     try testing.expect(audioBackendKindForType("minimax_music3") == .music3);
+    try testing.expect(audioBackendKindForType("stable_audio3") == .stable_audio3);
     try testing.expect(audioBackendKindForType("qwen3_tts") == .tts);
     try testing.expect(audioBackendKindForType("gemma4") == .tts);
-    // Both music engines serve /v1/audio/music-generations and advertise the
+    // Every music engine serves /v1/audio/music-generations and advertises the
     // "music" capability; TTS backends never do.
     try testing.expect(AudioBackendKind.music.servesMusic());
     try testing.expect(AudioBackendKind.music3.servesMusic());
+    try testing.expect(AudioBackendKind.stable_audio3.servesMusic());
     try testing.expect(!AudioBackendKind.tts.servesMusic());
     try testing.expect(!AudioBackendKind.kokoro.servesMusic());
 }
@@ -6040,6 +6136,9 @@ test "media markers are per-TYPE, not per-modality" {
     // Music3: the converter writes the vocoder LAST, so its presence is the
     // completeness marker for the whole five-file pack.
     try std.testing.expectEqualStrings("vocoder.safetensors", requiredMarkerFor("minimax_music3").?);
+    // Stable Audio 3: same contract, dit.safetensors written LAST
+    // (convert_stable_audio3_weights.MARKER).
+    try std.testing.expectEqualStrings("dit.safetensors", requiredMarkerFor("stable_audio3").?);
     // H3 must NOT be gated on LTX's file.
     try std.testing.expect(!std.mem.eql(u8, requiredMarkerFor("minimax_h3").?, "connector.safetensors"));
 

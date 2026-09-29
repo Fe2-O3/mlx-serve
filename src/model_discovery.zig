@@ -79,6 +79,9 @@ pub fn requiredMediaMarker(model_type: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, model_type, "minimax_h3")) return "transformer.safetensors";
     // MiniMax Music 3: the converter writes the vocoder LAST of the five files.
     if (std.mem.eql(u8, model_type, "minimax_music3")) return "vocoder.safetensors";
+    // Stable Audio 3: the converter writes dit.safetensors LAST (MARKER in
+    // convert_stable_audio3_weights.py — dit present == pack complete).
+    if (std.mem.eql(u8, model_type, "stable_audio3")) return "dit.safetensors";
     // ACE-Step: the text encoder is a subdir a partial pull can miss.
     if (std.mem.eql(u8, model_type, "acestep")) return "text_encoder/model.safetensors";
     return null;
@@ -96,6 +99,7 @@ pub fn isMediaModelType(model_type: []const u8) bool {
         std.mem.eql(u8, model_type, "AudioVideo") or
         std.mem.eql(u8, model_type, "minimax_h3") or
         std.mem.eql(u8, model_type, "minimax_music3") or
+        std.mem.eql(u8, model_type, "stable_audio3") or
         std.mem.eql(u8, model_type, "laya") or
         std.mem.startsWith(u8, model_type, "hunyuan3d");
 }
@@ -533,6 +537,7 @@ pub fn modelKindFromType(model_type: []const u8) ModelKind {
         std.mem.startsWith(u8, model_type, "qwen_image")) return .image;
     if (std.mem.eql(u8, model_type, "qwen3_tts") or
         std.mem.eql(u8, model_type, "acestep") or
+        std.mem.eql(u8, model_type, "stable_audio3") or
         std.mem.eql(u8, model_type, "minimax_music3")) return .audio;
     if (std.mem.eql(u8, model_type, "AudioVideo")) return .video;
     if (std.mem.startsWith(u8, model_type, "hunyuan3d")) return .mesh;
@@ -1278,6 +1283,16 @@ test "minimax_music3 classifies as audio media with the vocoder marker" {
     try testing.expect(isMediaModelType("minimax_music3"));
     try testing.expectEqual(ModelKind.audio, modelKindFromType("minimax_music3"));
     try testing.expectEqualStrings("vocoder.safetensors", requiredMediaMarker("minimax_music3").?);
+}
+
+test "stable_audio3 classifies as audio media with the DiT marker" {
+    try testing.expect(isMediaModelType("stable_audio3"));
+    try testing.expectEqual(ModelKind.audio, modelKindFromType("stable_audio3"));
+    // The converter writes dit.safetensors LAST of the pack's files — its
+    // presence is the completeness contract (convert_stable_audio3_weights).
+    try testing.expectEqualStrings("dit.safetensors", requiredMediaMarker("stable_audio3").?);
+    // Never inherit another music backend's marker.
+    try testing.expect(!std.mem.eql(u8, requiredMediaMarker("stable_audio3").?, "vocoder.safetensors"));
 }
 
 test "an ACE-Step pack without its text encoder does not shadow a complete copy in a later root" {

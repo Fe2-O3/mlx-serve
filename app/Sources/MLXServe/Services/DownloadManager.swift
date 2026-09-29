@@ -344,6 +344,7 @@ class DownloadManager: ObservableObject {
         case "AudioVideo": return "connector.safetensors"
         case "minimax_h3": return "transformer.safetensors"
         case "minimax_music3": return "vocoder.safetensors"
+        case "stable_audio3": return "dit.safetensors"
         case "acestep": return "text_encoder/model.safetensors"
         default: return nil
         }

@@ -1756,6 +1756,7 @@ pub fn samplePingPong(
     noises: []const mlx.mlx_array,
     cross: mlx.mlx_array,
     global_cond: mlx.mlx_array,
+    progress: ?sse.Progress,
     s: S,
 ) ![]mlx.mlx_array {
     const steps = sigmas.len - 1;
@@ -1764,6 +1765,10 @@ pub fn samplePingPong(
     var cur = x0;
     var draw: usize = 0;
     for (0..steps) |i| {
+        // A hung-up client latches `cancelled`; stop at the next step
+        // boundary (music3 does the same per chunk) instead of burning GPU
+        // on a response nobody will read.
+        if (progress) |p| if (p.cancelled()) return error.Cancelled;
         const t_curr = sigmas[i];
         const t_next = sigmas[i + 1];
         const cur_dtype = mlx.mlx_array_dtype(cur);
@@ -1808,6 +1813,7 @@ pub fn samplePingPong(
         evalA(next); // reference mx.eval(x) per step
         outs[i] = next;
         cur = next;
+        if (progress) |p| p.emit("sample", @intCast(i + 1), @intCast(steps));
     }
     return outs;
 }
@@ -1882,7 +1888,7 @@ test "stable_audio3 oracle: ping-pong sampler latents match reference" {
         }
     };
 
-    const lats = try samplePingPong(a, &dit, x0, sig_raw, noises[0..], cross, glob, st);
+    const lats = try samplePingPong(a, &dit, x0, sig_raw, noises[0..], cross, glob, null, st);
     defer {
         for (lats) |l| _ = mlx.mlx_array_free(l);
         a.free(lats);
@@ -2511,6 +2517,14 @@ fn sliceAxis2(x: mlx.mlx_array, lo: c_int, hi: c_int, s: S) !mlx.mlx_array {
 
 // ── engine: pack → WAV (reference = sa3_mlx.py generate) ────────────────────
 
+/// API-facing generation bounds — the medium pack's `seconds_min` /
+/// `seconds_max` (generate() clamps independently as a backstop) and the
+/// reference's ping-pong step default (sa3_mlx `--steps`, min 1).
+pub const MIN_DURATION_S: u32 = 1;
+pub const MAX_DURATION_S: u32 = 384;
+pub const DEFAULT_STEPS: u32 = 8;
+pub const MAX_STEPS: u32 = 100;
+
 pub const GenerateRequest = struct {
     prompt: []const u8,
     seconds: f32 = 30.0,
@@ -2648,7 +2662,7 @@ pub const Engine = struct {
         }
         if (key_owned) _ = mlx.mlx_array_free(key_cur);
 
-        const lats = try samplePingPong(allocator, &self.dit, x0, sigmas, noises, cond.cross, cond.global_cond, self.s);
+        const lats = try samplePingPong(allocator, &self.dit, x0, sigmas, noises, cond.cross, cond.global_cond, progress, self.s);
         defer {
             for (lats) |l| _ = mlx.mlx_array_free(l);
             allocator.free(lats);
