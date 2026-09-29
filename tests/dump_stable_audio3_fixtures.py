@@ -108,10 +108,34 @@ def write_ref_npz(out_path, arrays):
     log(f"reference npz: {out_path} ({os.path.getsize(out_path) / 1e6:.0f} MB)")
 
 
+def pack_f32_keys(path):
+    """Names the pack stores as float32 — these must NOT be f16-rounded.
+
+    The reference npz convention casts every weight to f16 (t5gemma_f16),
+    but the F32 keys are not weights: `rope_inv_freq` (official loader keeps
+    it f32 → rope phases in f32) and the DiT `cond.*` trio (official casts
+    padding_embedding to f32; SecondsTotalEmbedder runs in fp32). Rounding
+    them to f16 moves rope phases by up to 0.041 rad at position 255 — a
+    real divergence the e2e oracle then measures as a port bug.
+    """
+    import json
+    import struct
+
+    with open(path, "rb") as f:
+        n = struct.unpack("<Q", f.read(8))[0]
+        hdr = json.loads(f.read(n))
+    return {k for k, e in hdr.items() if e["dtype"] == "F32"}
+
+
 def prepare_dit_npz(pack, bits, scratch):
     """Dequantized DiT (+ baked `cond.*` conditioner) as npz for the loader."""
-    arrays = dequantized_pack_arrays(os.path.join(pack, "dit.safetensors"), bits)
-    f16 = {k: np.ascontiguousarray(v, dtype=np.float16) for k, v in arrays.items()}
+    path_in = os.path.join(pack, "dit.safetensors")
+    arrays = dequantized_pack_arrays(path_in, bits)
+    f32keys = pack_f32_keys(path_in)
+    f16 = {
+        k: (np.ascontiguousarray(v) if k in f32keys else np.ascontiguousarray(v, dtype=np.float16))
+        for k, v in arrays.items()
+    }
     del arrays
     path = os.path.join(scratch, "dit_pack.npz")
     write_ref_npz(path, f16)
@@ -120,8 +144,13 @@ def prepare_dit_npz(pack, bits, scratch):
 
 def prepare_t5gemma_npz(pack, npz_dir, bits, scratch):
     """Dequantized T5Gemma + META/TOKENIZER_MODEL (not tensors: loader input)."""
-    arrays = dequantized_pack_arrays(os.path.join(pack, "t5gemma.safetensors"), bits)
-    out = {k: np.ascontiguousarray(v, dtype=np.float16) for k, v in arrays.items()}
+    path_in = os.path.join(pack, "t5gemma.safetensors")
+    arrays = dequantized_pack_arrays(path_in, bits)
+    f32keys = pack_f32_keys(path_in)
+    out = {
+        k: (np.ascontiguousarray(v) if k in f32keys else np.ascontiguousarray(v, dtype=np.float16))
+        for k, v in arrays.items()
+    }
     with np.load(os.path.join(npz_dir, "t5gemma_f16.npz")) as z:
         out["META"] = z["META"]
         out["TOKENIZER_MODEL"] = z["TOKENIZER_MODEL"]
