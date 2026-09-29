@@ -1670,3 +1670,211 @@ test "stable_audio3 oracle: DiT velocity taps match reference" {
         try assertParity(v, ref, tap.label, 0.999, 0.01, st);
     }
 }
+
+// ── Ping-pong sampler (reference = sa3_pipeline.sample_flow_pingpong) ──
+//
+// t math runs on the host in f32 — the same IEEE ops the reference does on
+// f32 arrays (linspace, logsnr, casts); only sigmoid is host @exp, within
+// 1 ulp of MLX's kernel. The model itself always receives f32 t.
+
+/// linspace(sigma_max, 0, steps+1) → LogSNRShift (endpoints preserved) →
+/// re-anchor start to sigma_max. Returns host f32, len steps+1.
+pub fn buildPingpongSchedule(a: std.mem.Allocator, steps: usize, sigma_max: f32) ![]f32 {
+    const out = try a.alloc(f32, steps + 1);
+    errdefer a.free(out);
+    for (0..steps + 1) |i| {
+        const frac = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(steps));
+        const v = (1.0 - frac) * sigma_max;
+        if (v <= 0.0) {
+            out[i] = 0.0;
+            continue;
+        }
+        if (v >= 1.0) {
+            out[i] = 1.0;
+            continue;
+        }
+        const logsnr = 2.0 - v * 8.2; // logsnr_end − t·(logsnr_end − anchor)
+        out[i] = 1.0 / (1.0 + @exp(logsnr)); // sigmoid(−logsnr)
+    }
+    out[0] = sigma_max;
+    return out;
+}
+
+/// [1] array of `v` in `dtype`. f64 in, one rounding out — matches the
+/// reference's python float → array.astype(dtype) path.
+fn scalarIn(dtype: mlx.mlx_dtype, v: f64, s: S) !mlx.mlx_array {
+    const sh = [1]c_int{1};
+    switch (dtype) {
+        .float16 => {
+            const h: f16 = @floatCast(v);
+            return mlx.mlx_array_new_data(&h, &sh, 1, .float16);
+        },
+        .float32 => {
+            const f: f32 = @floatCast(v);
+            return mlx.mlx_array_new_data(&f, &sh, 1, .float32);
+        },
+        else => return error.UnsupportedSamplerDtype,
+    }
+    _ = s;
+}
+
+/// One rf_denoiser ping-pong loop. `sigmas` is the host schedule (len
+/// steps+1); `noises[k]` is the k-th redraw — drawn only while
+/// i < steps−1 && t_next > 0, so callers size it steps−1 for a healthy
+/// schedule (the engine passes MLX-random draws, the oracle fixtures).
+/// Returns `steps` latents; caller frees each plus the slice.
+pub fn samplePingPong(
+    a: std.mem.Allocator,
+    dit: *const Dit,
+    x0: mlx.mlx_array,
+    sigmas: []const f32,
+    noises: []const mlx.mlx_array,
+    cross: mlx.mlx_array,
+    global_cond: mlx.mlx_array,
+    s: S,
+) ![]mlx.mlx_array {
+    const steps = sigmas.len - 1;
+    const outs = try a.alloc(mlx.mlx_array, steps);
+    errdefer a.free(outs);
+    var cur = x0;
+    var draw: usize = 0;
+    for (0..steps) |i| {
+        const t_curr = sigmas[i];
+        const t_next = sigmas[i + 1];
+        const cur_dtype = mlx.mlx_array_dtype(cur);
+
+        // t_tensor: f32 [1] — sigmas are f32, so the model always sees f32 t.
+        const t_ten = try scalarIn(.float32, t_curr, s);
+        defer _ = mlx.mlx_array_free(t_ten);
+        const v = try dit.forward(a, cur, t_ten, cross, global_cond, null, s);
+        defer _ = mlx.mlx_array_free(v);
+
+        // denoised = x − t_curr.astype(x.dtype) * v
+        const tc = try scalarIn(cur_dtype, t_curr, s);
+        defer _ = mlx.mlx_array_free(tc);
+        const tv = try mulA(tc, v, s);
+        defer _ = mlx.mlx_array_free(tv);
+        const den = try subA(cur, tv, s);
+        var den_owned = true;
+        defer if (den_owned) {
+            _ = mlx.mlx_array_free(den);
+        };
+
+        var next: mlx.mlx_array = undefined;
+        if (i < steps - 1 and t_next > 0.0) {
+            if (draw >= noises.len) return error.NoiseDraw;
+            const noise = try astype(noises[draw], cur_dtype, s);
+            defer _ = mlx.mlx_array_free(noise);
+            draw += 1;
+            // (1 − t_next).astype(x.dtype)·denoised + t_next.astype(x.dtype)·noise
+            const om = try scalarIn(cur_dtype, 1.0 - @as(f64, t_next), s);
+            defer _ = mlx.mlx_array_free(om);
+            const t1 = try mulA(om, den, s);
+            defer _ = mlx.mlx_array_free(t1);
+            const tn = try scalarIn(cur_dtype, t_next, s);
+            defer _ = mlx.mlx_array_free(tn);
+            const t2 = try mulA(tn, noise, s);
+            defer _ = mlx.mlx_array_free(t2);
+            next = try addA(t1, t2, s);
+        } else {
+            next = den;
+            den_owned = false;
+        }
+        evalA(next); // reference mx.eval(x) per step
+        outs[i] = next;
+        cur = next;
+    }
+    return outs;
+}
+
+// ── Ping-pong sampler oracle ────────────────────────────────────────────────
+
+test "stable_audio3 oracle: ping-pong sampler latents match reference" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const dir = try sa3ModelDir();
+    const fix = try fixturesDir();
+    const st = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(st);
+
+    // ── schedule: built vs fixture ──
+    const built = try buildPingpongSchedule(a, 8, 1.0);
+    defer a.free(built);
+    const sig_raw = try readRawF32(io, a, fix, "sigmas.f32.raw");
+    defer a.free(sig_raw);
+    try testing.expectEqual(built.len, sig_raw.len);
+    const ssh = [1]c_int{@intCast(built.len)};
+    const sig_arr = mlx.mlx_array_new_data(built.ptr, &ssh, 1, .float32);
+    defer _ = mlx.mlx_array_free(sig_arr);
+    try assertParity(sig_arr, sig_raw, "sigmas", 0.9999, 0.001, st);
+
+    // ── loop driven by the FIXTURE schedule (isolates loop math) ──
+    const x0_raw = try readRawF32(io, a, fix, "x0.f32.raw");
+    defer a.free(x0_raw);
+    const cross_raw = try readRawF32(io, a, fix, "cross_attn.f32.raw");
+    defer a.free(cross_raw);
+    const glob_raw = try readRawF32(io, a, fix, "global_cond.f32.raw");
+    defer a.free(glob_raw);
+
+    var dit = try Dit.load(io, a, dir);
+    defer dit.deinit();
+
+    const xsh = [1]c_int{@intCast(x0_raw.len / 256)};
+    const x0_32 = mlx.mlx_array_new_data(x0_raw.ptr, &[_]c_int{ 1, 256, xsh[0] }, 3, .float32);
+    defer _ = mlx.mlx_array_free(x0_32);
+    const x0 = try astype(x0_32, .float16, st);
+    defer _ = mlx.mlx_array_free(x0);
+
+    const cross_32 = mlx.mlx_array_new_data(cross_raw.ptr, &[_]c_int{ 1, 257, 768 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(cross_32);
+    const cross = try astype(cross_32, .float16, st);
+    defer _ = mlx.mlx_array_free(cross);
+
+    const glob_32 = mlx.mlx_array_new_data(glob_raw.ptr, &[_]c_int{ 1, 768 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(glob_32);
+    const glob = try astype(glob_32, .float16, st);
+    defer _ = mlx.mlx_array_free(glob);
+
+    // 7 redraws for 8 steps (dump appends one per i < steps-1).
+    var noises: [7]mlx.mlx_array = undefined;
+    var noise_owned: [7]bool = undefined;
+    for (0..7) |k| {
+        const buf = try allocPrint_noise(a, k);
+        defer a.free(buf);
+        const raw = try readRawF32(io, a, fix, buf);
+        defer a.free(raw);
+        const nsh = [3]c_int{ 1, 256, xsh[0] };
+        const n32 = mlx.mlx_array_new_data(raw.ptr, &nsh, 3, .float32);
+        const arr = try astype(n32, .float16, st); // step 0 draws f16; steps 1+ cast back up
+        _ = mlx.mlx_array_free(n32);
+        noises[k] = arr;
+        noise_owned[k] = true;
+    }
+    defer for (noises, 0..) |n, k| {
+        if (noise_owned[k]) {
+            _ = mlx.mlx_array_free(n);
+        }
+    };
+
+    const lats = try samplePingPong(a, &dit, x0, sig_raw, noises[0..], cross, glob, st);
+    defer {
+        for (lats) |l| _ = mlx.mlx_array_free(l);
+        a.free(lats);
+    }
+    try testing.expectEqual(@as(usize, 8), lats.len);
+
+    for (lats, 1..) |lat, si| {
+        const name = try std.fmt.allocPrint(a, "latents_step{d:0>2}.f32.raw", .{si});
+        defer a.free(name);
+        const ref = try readRawF32(io, a, fix, name);
+        defer a.free(ref);
+        const label = try std.fmt.allocPrint(a, "step{d:0>2}", .{si});
+        defer a.free(label);
+        try assertParity(lat, ref, label, 0.999, 0.01, st);
+    }
+}
+
+fn allocPrint_noise(a: std.mem.Allocator, k: usize) ![]u8 {
+    return std.fmt.allocPrint(a, "noise_{d:0>2}.f32.raw", .{k});
+}
