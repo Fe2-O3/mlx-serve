@@ -262,6 +262,12 @@ fn mulA(x: mlx.mlx_array, y: mlx.mlx_array, s: S) !mlx.mlx_array {
     return o;
 }
 
+fn divA(x: mlx.mlx_array, y: mlx.mlx_array, s: S) !mlx.mlx_array {
+    var o = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_divide(&o, x, y, s));
+    return o;
+}
+
 /// Scalar in x's OWN dtype — the MLX weak-scalar rule (a bare f32 scalar
 /// would promote the f16 operands the reference keeps in f16).
 fn scalarLike(x: mlx.mlx_array, v: f32, s: S) !mlx.mlx_array {
@@ -751,6 +757,162 @@ pub const T5Gemma = struct {
     }
 };
 
+// ── conditioner: prompt padding + seconds_total token ──
+//
+// reference = sa3_pipeline.py apply_prompt_padding + SecondsTotalEmbedder
+// (weights baked into dit.safetensors as cond.* by the converter). Op order
+// mirrors the reference: f16 padding math, f32 fourier + linear, narrow to
+// f16 before the concat.
+
+pub const CondResult = struct {
+    cross: mlx.mlx_array,       // [1, S+1, 768] f16 — padded embeds + seconds token
+    global_cond: mlx.mlx_array, // [1, 768] f16 — the seconds embed row
+
+    pub fn deinit(self: CondResult) void {
+        _ = mlx.mlx_array_free(self.cross);
+        _ = mlx.mlx_array_free(self.global_cond);
+    }
+};
+
+pub fn conditionPrompt(
+    w: *const Weights,
+    embeds: mlx.mlx_array,
+    mask: []const i32,
+    seconds: f32,
+    s: S,
+) !CondResult {
+    const esh = mlx.getShape(embeds);
+    const B: c_int = esh[0];
+    const Sl: c_int = esh[1];
+    const dim: c_int = esh[2];
+
+    // embeds * m + pe * (1 - m)  — all in embeds' dtype (the reference rule)
+    const padded = blk: {
+        const msh = [_]c_int{ B, Sl };
+        const m_i = mlx.mlx_array_new_data(mask.ptr, &msh, 2, .int32);
+        defer _ = mlx.mlx_array_free(m_i);
+        const m = try astype(m_i, mlx.mlx_array_dtype(embeds), s);
+        defer _ = mlx.mlx_array_free(m);
+        var m1 = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_expand_dims(&m1, m, 2, s));
+        defer _ = mlx.mlx_array_free(m1);
+
+        const pe = try getW(w, "cond.padding_embedding");
+        const pe_d = try astype(pe, mlx.mlx_array_dtype(embeds), s);
+        defer _ = mlx.mlx_array_free(pe_d);
+        const psh = [_]c_int{ 1, 1, dim };
+        const pe3 = try reshape(pe_d, &psh, s);
+        defer _ = mlx.mlx_array_free(pe3);
+
+        const one = try scalarLike(m1, 1.0, s);
+        defer _ = mlx.mlx_array_free(one);
+        const invm = try subA(one, m1, s);
+        defer _ = mlx.mlx_array_free(invm);
+        const left = try mulA(embeds, m1, s);
+        defer _ = mlx.mlx_array_free(left);
+        const right = try mulA(pe3, invm, s);
+        defer _ = mlx.mlx_array_free(right);
+        break :blk try addA(left, right, s);
+    };
+    defer _ = mlx.mlx_array_free(padded);
+
+    // seconds_total → [1,1,768] f16 (NumberConditioner: clip → /384 → expo
+    // fourier 256 → linear 768, all f32, narrowed after)
+    const secs_embed = blk: {
+        const raw = mlx.mlx_array_new_float(seconds);
+        defer _ = mlx.mlx_array_free(raw);
+        const lo = mlx.mlx_array_new_float(0.0);
+        defer _ = mlx.mlx_array_free(lo);
+        const hi = mlx.mlx_array_new_float(384.0);
+        defer _ = mlx.mlx_array_free(hi);
+        var clipped = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_clip(&clipped, raw, lo, hi, s));
+        defer _ = mlx.mlx_array_free(clipped);
+        const d384 = mlx.mlx_array_new_float(384.0);
+        defer _ = mlx.mlx_array_free(d384);
+        var norm = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_divide(&norm, clipped, d384, s));
+        defer _ = mlx.mlx_array_free(norm);
+        const tsh = [_]c_int{ 1, 1 };
+        const t = try reshape(norm, &tsh, s);
+        defer _ = mlx.mlx_array_free(t);
+
+        var ramp0 = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_arange(&ramp0, 0, 128, 1, .float32, s));
+        defer _ = mlx.mlx_array_free(ramp0);
+        const d127 = mlx.mlx_array_new_float(127.0);
+        defer _ = mlx.mlx_array_free(d127);
+        const ramp = try divA(ramp0, d127, s);
+        defer _ = mlx.mlx_array_free(ramp);
+        const span = mlx.mlx_array_new_float(@floatCast(@log(@as(f64, 10000.0)) - @log(@as(f64, 0.5))));
+        defer _ = mlx.mlx_array_free(span);
+        const rm = try mulA(ramp, span, s);
+        defer _ = mlx.mlx_array_free(rm);
+        const lmin = mlx.mlx_array_new_float(@floatCast(@log(@as(f64, 0.5))));
+        defer _ = mlx.mlx_array_free(lmin);
+        const ra = try addA(rm, lmin, s);
+        defer _ = mlx.mlx_array_free(ra);
+        var freqs = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_exp(&freqs, ra, s));
+        defer _ = mlx.mlx_array_free(freqs);
+
+        // args = t * freqs * 2 * pi  → [1,128]
+        const tf = try mulA(t, freqs, s);
+        defer _ = mlx.mlx_array_free(tf);
+        const t2 = try mulScalar(tf, 2.0, s);
+        defer _ = mlx.mlx_array_free(t2);
+        const args = try mulScalar(t2, 3.141592653589793, s);
+        defer _ = mlx.mlx_array_free(args);
+
+        var cs = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_cos(&cs, args, s));
+        defer _ = mlx.mlx_array_free(cs);
+        var sn = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_sin(&sn, args, s));
+        defer _ = mlx.mlx_array_free(sn);
+        const vv = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(vv);
+        _ = mlx.mlx_vector_array_append_value(vv, cs);
+        _ = mlx.mlx_vector_array_append_value(vv, sn);
+        var ff = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_concatenate_axis(&ff, vv, 1, s));
+        defer _ = mlx.mlx_array_free(ff);
+
+        // ff @ W.T + b → [1,768] f32 → [1,1,768] f16
+        const W = try getW(w, "cond.seconds_total_weight");
+        const wt = [_]c_int{ 1, 0 };
+        const Wt = try transposeA(W, &wt, s);
+        defer _ = mlx.mlx_array_free(Wt);
+        var proj = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_matmul(&proj, ff, Wt, s));
+        defer _ = mlx.mlx_array_free(proj);
+        const b = try getW(w, "cond.seconds_total_bias");
+        const lin_o = try addA(proj, b, s);
+        defer _ = mlx.mlx_array_free(lin_o);
+        var e1 = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_expand_dims(&e1, lin_o, 1, s));
+        defer _ = mlx.mlx_array_free(e1);
+        break :blk try astype(e1, .float16, s);
+    };
+    defer _ = mlx.mlx_array_free(secs_embed);
+
+    // cross = concat(padded, seconds_embed, axis=1) → [1, S+1, 768]
+    const cv = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(cv);
+    _ = mlx.mlx_vector_array_append_value(cv, padded);
+    _ = mlx.mlx_vector_array_append_value(cv, secs_embed);
+    var cross = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_concatenate_axis(&cross, cv, 1, s));
+    errdefer _ = mlx.mlx_array_free(cross);
+
+    // global_cond = seconds_embed[:, 0, :] — reshape IS that integer-index
+    // view (dim removed, same buffer).
+    const gsh = [_]c_int{ 1, dim };
+    const global = try reshape(secs_embed, &gsh, s);
+
+    return .{ .cross = cross, .global_cond = global };
+}
+
 // ── T5Gemma oracle ──────────────────────────────────────────────────────────
 
 test "stable_audio3 oracle: T5Gemma hidden matches reference" {
@@ -793,4 +955,62 @@ test "stable_audio3 oracle: T5Gemma empty prompt matches reference" {
     const hidden = try enc.encode(a, ids, mask, enc.s);
     defer _ = mlx.mlx_array_free(hidden);
     try assertParity(hidden, ref, "t5 empty", 0.999, 0.01, enc.s);
+}
+
+// ── conditioner oracle ──────────────────────────────────────────────────────
+
+fn readMetaSeconds(io: std.Io, a: std.mem.Allocator, fix: []const u8) !f32 {
+    const path = try std.fmt.allocPrint(a, "{s}/meta.json", .{fix});
+    defer a.free(path);
+    const f = try std.Io.Dir.openFileAbsolute(io, path, .{});
+    defer f.close(io);
+    var rb: [4096]u8 = undefined;
+    var rs = f.reader(io, &rb);
+    const content = try rs.interface.allocRemaining(a, .limited(4 * 1024 * 1024));
+    defer a.free(content);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, content, .{});
+    defer parsed.deinit();
+    const v = parsed.value.object.get("seconds") orelse return error.MetaMissingSeconds;
+    return switch (v) {
+        .float => @floatCast(v.float),
+        .integer => @floatFromInt(v.integer),
+        else => error.MetaBadSeconds,
+    };
+}
+
+test "stable_audio3 oracle: conditioner cross_attn + global_cond match reference" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const dir = try sa3ModelDir();
+    const fix = try fixturesDir();
+    const st = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(st);
+
+    const embeds_raw = try readRawF32(io, a, fix, "t5_hidden_cond.f32.raw");
+    defer a.free(embeds_raw);
+    const mask = try readRawI32(io, a, fix, "mask_cond.i32.raw");
+    defer a.free(mask);
+    const ref_cross = try readRawF32(io, a, fix, "cross_attn.f32.raw");
+    defer a.free(ref_cross);
+    const ref_glob = try readRawF32(io, a, fix, "global_cond.f32.raw");
+    defer a.free(ref_glob);
+    const seconds = try readMetaSeconds(io, a, fix);
+
+    var w = try loadFileWeights(a, dir, "dit.safetensors");
+    defer w.deinit();
+
+    // fixture hidden is f16-valued stored as f32 — back to the f16 the
+    // reference conditioner consumed (exact: values are f16-representable).
+    const msh = [_]c_int{ 1, 256, 768 };
+    const e32 = mlx.mlx_array_new_data(embeds_raw.ptr, &msh, 3, .float32);
+    defer _ = mlx.mlx_array_free(e32);
+    const embeds = try astype(e32, .float16, st);
+    defer _ = mlx.mlx_array_free(embeds);
+
+    const out = try conditionPrompt(&w, embeds, mask, seconds, st);
+    defer out.deinit();
+
+    try assertParity(out.cross, ref_cross, "cond cross", 0.999, 0.01, st);
+    try assertParity(out.global_cond, ref_glob, "cond global", 0.999, 0.01, st);
 }
