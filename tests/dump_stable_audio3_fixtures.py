@@ -33,14 +33,23 @@ Fixture taps (all under --out, default ~/claude-tmp/sa3/fixtures):
   t5_hidden_cond.f32.raw [1,256,768]  T5Gemma last hidden (cond)
   t5_hidden_empty.f32.raw[1,256,768]  T5Gemma last hidden (empty prompt)
   cross_attn.f32.raw     [1,257,768]  padded embeds + seconds token
+  cross_attn_neg.f32.raw [1,257,768]  the same, from NEG_PROMPT (CFG uncond)
   global_cond.f32.raw    [1,768]      the seconds embed (also the global cond)
   x0.f32.raw             [1,256,T]    seeded initial noise (the sampler input)
   v_t01/v_t05/v_t09.f32.raw [1,256,T] DiT velocity at t = 0.1 / 0.5 / 0.9
+  ids_neg.i32.raw        [L]          NEG_PROMPT token ids
+  mask_neg.i32.raw       [256]        NEG_PROMPT attention mask
+  cfg_v_apg1_t01/t09.f32.raw [1,256,T] CFG velocity (cfg=3, APG full, neg)
+  cfg_v_apg0_t05.f32.raw [1,256,T]     CFG velocity, vanilla branch (apg=0)
+  cfg_v_apg05_t05.f32.raw[1,256,T]     CFG velocity, blend branch (apg=0.5)
+  cfg_v_zerouncond_t05.f32.raw [1,256,T] CFG velocity, no negative prompt
   sigmas.f32.raw         [steps+1]    ping-pong schedule (logsnr-shifted)
   noise_00..NN.f32.raw   [1,256,T]    per-step redraw (steps-1 of them)
   latents_stepNN.f32.raw [1,256,T]    latent after each step (01 .. final)
+  latents_cfg_final.f32.raw [1,256,T] final latent of a full CFG run
   patches_TNN.f32.raw    decoder output for the arms in meta.decode
   audio_TNN.f32.raw      [1,2,S]      patched + trimmed stereo (production arm)
+  audio_cfg.f32.raw      [1,2,S]      the CFG run decoded (e2e oracle)
   meta.json              shapes, seeds, dispatch, tokenizer cross-check
 
 Then:  export SA3_TEST_MODEL=<pack> SA3_FIXTURES=<out>  and run the Zig
@@ -73,6 +82,24 @@ SEED = 1234
 # sa3_mlx.py taps for the three velocity probes (kept as f32 scalars; the
 # sampler hands the model an f32 `t` because sigmas is f32).
 VEL_TAPS = (0.1, 0.5, 0.9)
+
+# Stage-2 (CFG) ground truth: sa3_mlx.py --negative-prompt / --cfg / --apg.
+# The uncond branch runs whenever cfg != 1.0; this prompt exercises the
+# negative-embedding path (a separate T5 pass + the same padding/seconds
+# concat). CFG probes reuse VEL_TAPS-style f32 t.
+NEG_PROMPT = "muffled, distorted, low quality, background noise"
+CFG_SCALE = 3.0
+# (name, cfg, apg, use_negative_prompt, t) → one CFG velocity fixture each.
+# Covers: the full-APG main branch at two t's, the vanilla (apg=0) branch,
+# the intermediate blend (apg=0.5), and the zeros-uncond branch (no neg).
+CFG_TAPS = (
+    ("cfg_v_apg1_t01", 3.0, 1.0, True, 0.1),
+    ("cfg_v_apg1_t09", 3.0, 1.0, True, 0.9),
+    ("cfg_v_apg0_t05", 3.0, 0.0, True, 0.5),
+    ("cfg_v_apg05_t05", 3.0, 0.5, True, 0.5),
+    ("cfg_v_zerouncond_t05", 3.0, 1.0, False, 0.5),
+)
+CFG_RUN = (3.0, 1.0)  # (cfg, apg) of the full 8-step sampled run + audio_cfg
 
 
 def log(msg):
@@ -196,6 +223,45 @@ def sample_loop(model_fn, x, sigmas, seed):
     return latents, noises
 
 
+def cfg_model_fn(dit, cross, null_cross, global_cond, cfg, apg):
+    """sa3_mlx.py's `model_fn` CFG branch (lines ~736-762), verbatim math.
+
+    sa3_mlx defines it inline inside main(), so it cannot be imported — the
+    body below is a direct copy (names adapted: args.* → locals, cross_attn
+    → cross). Batched cond+uncond forward over cat([x, x]); blend happens in
+    denoised space (RF: denoised = x - σ·v), with optional APG projection,
+    then converts back to velocity.
+    """
+
+    def model_fn(x, t):
+        x2 = mx.concatenate([x, x], axis=0)
+        t2 = mx.concatenate([t, t], axis=0)
+        cross2 = mx.concatenate([cross, null_cross], axis=0)
+        global2 = mx.concatenate([global_cond, global_cond], axis=0)
+        v_batched = dit(x2, t2, cross2, global2, local_add_cond=None)
+        cond_v, uncond_v = mx.split(v_batched, 2, axis=0)
+
+        sigma = t.reshape(-1, 1, 1).astype(mx.float32)
+        cond_d = x.astype(mx.float32) - cond_v.astype(mx.float32) * sigma
+        uncond_d = x.astype(mx.float32) - uncond_v.astype(mx.float32) * sigma
+        diff = cond_d - uncond_d
+
+        if apg <= 0.0:
+            cfg_diff = diff
+        else:
+            norm = mx.sqrt((cond_d * cond_d).sum(axis=(-2, -1), keepdims=True))
+            unit = cond_d / mx.maximum(norm, 1e-8)
+            parallel = (diff * unit).sum(axis=(-2, -1), keepdims=True) * unit
+            diff_orth = diff - parallel
+            cfg_diff = diff_orth if apg >= 1.0 else (apg * diff_orth + (1.0 - apg) * diff)
+
+        cfg_d = cond_d + (cfg - 1.0) * cfg_diff
+        cfg_v = (x.astype(mx.float32) - cfg_d) / sigma
+        return cfg_v.astype(x.dtype)
+
+    return model_fn
+
+
 # ------------------------------------------------------------------ dumping ---
 def dump(out, name, arr, meta, dtype=None):
     a = np.asarray(arr if isinstance(arr, np.ndarray) else np.array(arr))
@@ -247,6 +313,9 @@ def main(argv=None):
         "steps": steps,
         "seed": seed,
         "cfg": 1.0,
+        "neg_prompt": NEG_PROMPT,
+        "cfg_taps": [list(t) for t in CFG_TAPS],
+        "cfg_run": {"cfg": CFG_RUN[0], "apg": CFG_RUN[1], "negative_prompt": NEG_PROMPT},
         "t_lat": T_lat,
         "sample_rate": SAMPLE_RATE,
         "samples_per_latent": SAMPLES_PER_LATENT,
@@ -266,7 +335,7 @@ def main(argv=None):
         sp = spm.SentencePieceProcessor()
         sp.LoadFromSerializedProto(z["TOKENIZER_MODEL"].tobytes())
     hf = Tokenizer.from_file(os.path.join(args.pack, "tokenizer.json"))
-    for p in (PROMPT, ""):
+    for p in (PROMPT, "", NEG_PROMPT):
         proto, js = sp.Encode(p), hf.encode(p).ids
         if proto != js:
             raise SystemExit(
@@ -275,9 +344,15 @@ def main(argv=None):
                 "Zig reads tokenizer.json, so the pack would never match the reference.")
     ids_cond = np.asarray(sp.Encode(PROMPT), dtype=np.int32)
     ids_empty = np.asarray(sp.Encode(""), dtype=np.int32)
+    ids_neg = np.asarray(sp.Encode(NEG_PROMPT), dtype=np.int32)
+    if len(ids_neg) > 256:
+        raise SystemExit(f"[FATAL] NEG_PROMPT tokenizes to {len(ids_neg)} ids (> 256 = truncation "
+                         "zone; the fixture would pin truncation instead of conditioning)")
     mask_cond = np.zeros(256, dtype=np.int32)
     mask_cond[: len(ids_cond)] = 1
     mask_empty = np.zeros(256, dtype=np.int32)
+    mask_neg = np.zeros(256, dtype=np.int32)
+    mask_neg[: len(ids_neg)] = 1
     log("  tokenizer.json == SentencePiece proto (no BOS is added)")
 
     # ── 2. T5Gemma forward (empty prompt takes the reference's own special
@@ -300,7 +375,14 @@ def main(argv=None):
     seconds_embed = secs(seconds).astype(dtype)
     cross = mx.concatenate([embeds_padded, seconds_embed], axis=1)
     global_cond = seconds_embed[:, 0, :]
-    mx.eval(cross, global_cond)
+    # CFG uncond branch: the SAME seconds token appended to the negative
+    # prompt's padded embeds (sa3_mlx.py:617-626 shares seconds_embed; the
+    # zeros-uncond case needs no fixture — it is zeros_like(cross)).
+    embeds_neg, mask_neg_out = enc.encode([NEG_PROMPT], max_len=256)
+    embeds_neg = embeds_neg.astype(dtype)
+    embeds_neg_padded = pipe.apply_prompt_padding(embeds_neg, mask_neg_out, padding_emb.astype(dtype))
+    cross_neg = mx.concatenate([embeds_neg_padded, seconds_embed], axis=1)
+    mx.eval(cross, global_cond, cross_neg)
 
     # ── 4. DiT velocity probes + sampler inputs.
     log("stage 4/6  DiT")
@@ -314,6 +396,18 @@ def main(argv=None):
         v = dit(x0, t, cross, global_cond, local_add_cond=None)
         mx.eval(v)
         t_taps[tv] = v
+
+    # CFG probes: one batched cond+uncond forward + the guidance formula at
+    # each tap (see CFG_TAPS for which formula branch each one pins).
+    cfg_taps = {}
+    for name, cfgv, apgv, use_neg, tv in CFG_TAPS:
+        null_cross = cross_neg if use_neg else mx.zeros_like(cross)
+        fn = cfg_model_fn(dit, cross, null_cross, global_cond, cfgv, apgv)
+        t = mx.array(tv, dtype=mx.float32) * mx.ones((1,), dtype=x0.dtype)
+        v = fn(x0, t)
+        mx.eval(v)
+        cfg_taps[name] = v
+        log(f"  cfg tap {name}: cfg={cfgv} apg={apgv} neg={use_neg} t={tv}")
     del dit
     mx.clear_cache() if hasattr(mx, "clear_cache") else None
 
@@ -334,6 +428,16 @@ def main(argv=None):
         raise SystemExit(f"[FATAL] sampler reimplementation diverges from the "
                          f"reference: max|diff| = {delta}")
     log(f"  sampler matches sample_flow_pingpong (max|diff| = {delta:g})")
+
+    # Full CFG sampled run (stage-2 e2e): same schedule + noise chain, the
+    # guidance model_fn. No pipe cross-check here — sample_flow_pingpong
+    # already proved the loop, and cfg_model_fn is itself the copied
+    # reference math, so re-running it through pipe would only re-prove the
+    # loop at 2x the cost of the most expensive run in this script.
+    cfg_run = CFG_RUN
+    fn_cfg = cfg_model_fn(dit, cross, cross_neg, global_cond, cfg_run[0], cfg_run[1])
+    latents_cfg, _ = sample_loop(fn_cfg, x0, sigmas, seed + 1)
+    log(f"  cfg run done (cfg={cfg_run[0]} apg={cfg_run[1]}, neg prompt)")
     del dit
     mx.clear_cache() if hasattr(mx, "clear_cache") else None
 
@@ -359,6 +463,18 @@ def main(argv=None):
         audio = pipe.patched_decode(patches, patch_size=256, channels=2)
         audio = audio[..., : int(round(seconds * SAMPLE_RATE))]
         mx.eval(audio)
+    # CFG run decode — the stage-2 e2e oracle target (same dispatch rule).
+    latents_cfg_final = latents_cfg[-1].astype(mx.float32)
+    if T_lat > 128 + 2 * 8:
+        patches_cfg = dec_mod.decode_chunked(decoder, latents_cfg_final, 128, 8)
+        decode_arms["cfg_run"] = f"chunked(chunk=128, ovl=8), T_lat={T_lat}"
+    else:
+        patches_cfg = decoder(latents_cfg_final)
+        decode_arms["cfg_run"] = f"un-chunked, T_lat={T_lat}"
+    mx.eval(patches_cfg)
+    audio_cfg = pipe.patched_decode(patches_cfg, patch_size=256, channels=2)
+    audio_cfg = audio_cfg[..., : int(round(seconds * SAMPLE_RATE))]
+    mx.eval(audio_cfg)
     # Short-arm fixtures: the dispatch also hands the decoder even-length
     # direct calls and odd T <= kernel through chunk(2, ovl 2).
     patches_t8 = decoder(latents_final[..., :8])
@@ -393,6 +509,14 @@ def main(argv=None):
     dump(args.out, f"audio_T{T_lat}.f32.raw", f32(audio), meta, dtype="f32")
     dump(args.out, "patches_T8_direct.f32.raw", f32(patches_t8), meta, dtype="f32")
     dump(args.out, "patches_T7_chunk2.f32.raw", f32(patches_t7), meta, dtype="f32")
+    # stage-2 (CFG scale + negative prompt) fixtures
+    dump(args.out, "ids_neg.i32.raw", ids_neg, meta)
+    dump(args.out, "mask_neg.i32.raw", mask_neg, meta)
+    dump(args.out, "cross_attn_neg.f32.raw", f32(cross_neg), meta, dtype="f32")
+    for name, v in cfg_taps.items():
+        dump(args.out, f"{name}.f32.raw", f32(v), meta, dtype="f32")
+    dump(args.out, "latents_cfg_final.f32.raw", f32(latents_cfg_final), meta, dtype="f32")
+    dump(args.out, "audio_cfg.f32.raw", f32(audio_cfg), meta, dtype="f32")
 
     meta_path = os.path.join(args.out, "meta.json")
     with open(meta_path, "w") as f:
