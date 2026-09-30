@@ -261,6 +261,13 @@ struct MusicGenSettings: Codable, Equatable {
     var coverStrength: Double = 1.0
     var coverNoiseStrength: Double = 0.0
     var trackClasses: [String] = []
+    /// Stage-2 guidance (Stable Audio 3 only on the wire): CFG scale,
+    /// its unconditional branch, and APG. Sticky like the rest — a value
+    /// lingering across a model switch is dropped by `requestBody`'s
+    /// `supportsGuidance` gate, never sent to an engine that 400s it.
+    var cfgScale: Double = 1.0
+    var negativePrompt: String = ""
+    var apg: Double = 1.0
 
     private static let storageKey = "musicGenSettings"
 
@@ -317,6 +324,9 @@ extension MusicGenSettings {
         if let v = try c.decodeIfPresent(Double.self, forKey: .coverStrength) { coverStrength = v }
         if let v = try c.decodeIfPresent(Double.self, forKey: .coverNoiseStrength) { coverNoiseStrength = v }
         if let v = try c.decodeIfPresent([String].self, forKey: .trackClasses) { trackClasses = v }
+        if let v = try c.decodeIfPresent(Double.self, forKey: .cfgScale) { cfgScale = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .negativePrompt) { negativePrompt = v }
+        if let v = try c.decodeIfPresent(Double.self, forKey: .apg) { apg = v }
     }
 }
 

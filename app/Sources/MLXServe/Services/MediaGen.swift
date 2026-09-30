@@ -1473,6 +1473,12 @@ struct MusicModelPreset: Identifiable, Hashable {
     /// list in the instruction). Music 3 names both fields a 400. Gates the
     /// mode control AND every field it brings.
     var supportsSourceAudio: Bool { family == .acestep }
+    /// CFG scale + negative prompt + APG (server `cfg_scale` /
+    /// `negative_prompt` / `apg`): Stable Audio 3's batched cond+uncond
+    /// guidance pass. The other families have no such server fields — each
+    /// would be a named 400 — so the knobs AND the fields are gated together
+    /// (sticky values survive a model switch, like the tempo/key gate above).
+    var supportsGuidance: Bool { family == .stableAudio3 }
 
     /// ACE-Step v1.5 XL Turbo, 8-bit — 4B-class DiT, 8-step distilled.
     /// Published converted repo (DiT+encoders, Oobleck VAE, Qwen3-Embedding
@@ -2279,6 +2285,20 @@ struct MusicGenRequest {
     var coverStrength: Double = 1.0
     /// Cover: start from a blend with the source instead of pure noise (0 = off).
     var coverNoiseStrength: Double = 0.0
+    /// CFG scale (server `cfg_scale`, Stable Audio 3 only): 1.0 = guidance
+    /// off (the reference default), >1 pushes toward the prompt, [0,1) pulls
+    /// toward the unconditional branch. Sticky across model switches — sent
+    /// only where `supportsGuidance`.
+    var cfgScale: Double = 1.0
+    /// CFG unconditional branch (server `negative_prompt`, SA3 only): what
+    /// generation should steer AWAY from. Only valid beside cfgScale != 1.0
+    /// (guidance off has no uncond branch), so the service omits the field
+    /// while guidance is off and sticky text never earns a 400.
+    var negativePrompt: String = ""
+    /// APG (server `apg`, SA3 only), 0...1: projects the CFG difference
+    /// orthogonal to the conditional prediction — 1 = full APG (reference
+    /// default), 0 = vanilla CFG. Only sent alongside an active cfg_scale.
+    var apg: Double = 1.0
     /// Complete: instruments to add, from `MusicTask.trackClasses`; empty =
     /// the model decides.
     var trackClasses: [String] = []

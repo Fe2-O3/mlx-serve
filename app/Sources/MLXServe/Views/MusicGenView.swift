@@ -65,6 +65,11 @@ struct MusicGenView: View {
     @State private var coverStrength: Double = 1.0
     @State private var coverNoiseStrength: Double = 0.0
     @State private var trackClasses: [String] = []
+    // Stage-2 guidance (Stable Audio 3 only; sticky across switches like the
+    // knobs above — `requestBody` drops them on any other family).
+    @State private var cfgScale: Double = 1.0
+    @State private var negativePrompt: String = ""
+    @State private var apg: Double = 1.0
     /// Keep the model resident after generating (default off → unload).
     @State private var keepResident: Bool = false
     /// Hydration guard — see ImageGenView for the full rationale.
@@ -714,6 +719,52 @@ struct MusicGenView: View {
                         .font(.app(.caption2)).foregroundStyle(.secondary)
                 }
             }
+            // CFG scale + negative prompt + APG: Stable Audio 3's batched
+            // cond+uncond guidance pass (stage 2 of the port). The other
+            // families have NO server fields for these — each would be a
+            // named 400 — so the knobs live and die with supportsGuidance,
+            // exactly like the fields `requestBody` gates below.
+            if model.supportsGuidance {
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Text("Guidance (CFG)").font(.app(.caption))
+                        Spacer()
+                        Text(String(format: "%.1f", cfgScale))
+                            .font(.app(.caption).monospacedDigit()).foregroundStyle(.secondary)
+                    }
+                    Slider(value: $cfgScale, in: 0...15, step: 0.5)
+                    Text("1.0 is off. Higher follows the prompt harder; below 1.0 pulls toward the negative prompt.")
+                        .font(.app(.caption2)).foregroundStyle(.secondary)
+                }
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Negative prompt").font(.app(.caption))
+                    TextField("", text: $negativePrompt,
+                              prompt: Text("what to steer away from (optional)"))
+                        .textFieldStyle(.roundedBorder)
+                        .font(.app(.caption))
+                    // The server refuses the pair (guidance off has no
+                    // uncond branch), so the field is dropped while the
+                    // slider sits at 1.0 — say so instead of letting the
+                    // text look ignored.
+                    Text(cfgScale == 1.0
+                         ? "Guidance is off, so this text is not sent."
+                         : "Generation steers away from these words.")
+                        .font(.app(.caption2)).foregroundStyle(.secondary)
+                }
+                .padding(.top, 6)
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Text("APG").font(.app(.caption))
+                        Spacer()
+                        Text(String(format: "%.2f", apg))
+                            .font(.app(.caption).monospacedDigit()).foregroundStyle(.secondary)
+                    }
+                    Slider(value: $apg, in: 0...1, step: 0.05)
+                    Text("Adaptive Projected Guidance — only used with guidance on. 1.0 (default) keeps strong guidance from over-saturating; 0 is plain CFG.")
+                        .font(.app(.caption2)).foregroundStyle(.secondary)
+                }
+                .padding(.top, 6)
+            }
             // Dropdowns only — every choice is a value the server accepts,
             // "Auto" leaves the decision to the model (field omitted). The
             // whole musical-metadata knob set is ACE-Step's; Music 3 has no
@@ -944,6 +995,9 @@ struct MusicGenView: View {
         coverStrength = s.coverStrength
         coverNoiseStrength = s.coverNoiseStrength
         trackClasses = s.trackClasses
+        cfgScale = s.cfgScale
+        negativePrompt = s.negativePrompt
+        apg = s.apg
     }
 
     /// Every sticky field, as the blob it would persist to — `Equatable`, so
@@ -970,6 +1024,9 @@ struct MusicGenView: View {
         s.coverStrength = coverStrength
         s.coverNoiseStrength = coverNoiseStrength
         s.trackClasses = trackClasses
+        s.cfgScale = cfgScale
+        s.negativePrompt = negativePrompt
+        s.apg = apg
         return s
     }
 
@@ -1099,6 +1156,9 @@ struct MusicGenView: View {
             srcAudioPath: srcAudioURL?.path,
             coverStrength: coverStrength,
             coverNoiseStrength: coverNoiseStrength,
+            cfgScale: cfgScale,
+            negativePrompt: negativePrompt,
+            apg: apg,
             trackClasses: trackClasses,
             lanModelId: lanModel
         )

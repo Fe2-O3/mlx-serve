@@ -78,6 +78,99 @@ final class MusicGenTests: XCTestCase {
         XCTAssertTrue(txt.contains("duration_seconds: 384"), "records the clamped value actually sent")
     }
 
+    /// Stage 2 of the SA3 port: CFG scale + negative prompt + APG travel ONLY
+    /// to the one engine that reads them, and the pairing the server enforces
+    /// (negative_prompt REQUIRES cfg_scale != 1.0) holds on the wire — sticky
+    /// negative text while the slider sits at 1.0 would be a server 400.
+    func testStableAudio3GuidanceFieldsAreGatedAndPaired() throws {
+        XCTAssertTrue(MusicModelPreset.stableAudio3Medium.supportsGuidance)
+        XCTAssertFalse(MusicModelPreset.acestepXLTurbo8bit.supportsGuidance)
+        XCTAssertFalse(MusicModelPreset.miniMaxMusic3_8bit.supportsGuidance)
+        for p in MusicModelPreset.all {
+            XCTAssertEqual(p.supportsGuidance, p.family == .stableAudio3, p.id)
+        }
+
+        // Guidance on: all three fields ride, exactly as set, and the sidecar
+        // claims the same run the body asked for.
+        var on = MusicGenRequest(model: .stableAudio3Medium, prompt: "piano")
+        on.cfgScale = 3.0
+        on.negativePrompt = "muffled, distorted"
+        on.apg = 0.5
+        let body = MusicGenService.requestBody(on, modelName: "sa3")
+        XCTAssertEqual(body["cfg_scale"] as? Double, 3.0)
+        XCTAssertEqual(body["negative_prompt"] as? String, "muffled, distorted")
+        XCTAssertEqual(body["apg"] as? Double, 0.5)
+        let txt = MusicGenService.settingsText(on, resolvedSeed: 7, modelName: "sa3")
+        XCTAssertTrue(txt.contains("cfg_scale: 3.0"))
+        XCTAssertTrue(txt.contains("negative_prompt: muffled, distorted"))
+        XCTAssertTrue(txt.contains("apg: 0.5"))
+
+        // Guidance off: negative text may linger in sticky settings but must
+        // NOT travel (the server names the pair a 400) nor be claimed sent.
+        var off = MusicGenRequest(model: .stableAudio3Medium, prompt: "piano")
+        off.cfgScale = 1.0
+        off.negativePrompt = "sticky leftover"
+        off.apg = 0.5
+        let offBody = MusicGenService.requestBody(off, modelName: "sa3")
+        XCTAssertEqual(offBody["cfg_scale"] as? Double, 1.0, "cfg rides even at 1.0 (explicit off)")
+        XCTAssertNil(offBody["negative_prompt"])
+        XCTAssertNil(offBody["apg"])
+        let offTxt = MusicGenService.settingsText(off, resolvedSeed: 7, modelName: "sa3")
+        XCTAssertTrue(offTxt.contains("cfg_scale: 1.0"))
+        XCTAssertFalse(offTxt.contains("negative_prompt"),
+                       "an omitted field must not be recorded as sent")
+        XCTAssertFalse(offTxt.contains("apg"))
+
+        // The other engines name every one of these fields a 400 — sticky
+        // values across a model switch must not reach them.
+        var ace = MusicGenRequest(model: .acestepXLTurbo8bit, prompt: "piano")
+        ace.cfgScale = 3.0
+        ace.negativePrompt = "no drums"
+        ace.apg = 0.5
+        let aceBody = MusicGenService.requestBody(ace, modelName: "ace")
+        XCTAssertNil(aceBody["cfg_scale"])
+        XCTAssertNil(aceBody["negative_prompt"])
+        XCTAssertNil(aceBody["apg"])
+        XCTAssertFalse(MusicGenService.settingsText(ace, resolvedSeed: 1, modelName: "ace")
+            .contains("cfg_scale"))
+
+        // The server's pairing rule is the contract the wire-shape above
+        // exists to satisfy — pin the message so a server change surfaces
+        // here rather than in a live 400.
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent()
+        let gen = try String(contentsOf: root.appendingPathComponent("src/gen.zig"), encoding: .utf8)
+        XCTAssertTrue(gen.contains("'negative_prompt' needs an uncond branch"),
+                      "src/gen.zig no longer refuses negative_prompt beside cfg_scale == 1.0")
+    }
+
+    /// The three guidance knobs are sticky like every other music setting:
+    /// they survive a pane unmount, and a blob written by a build that
+    /// predates them still decodes (the decodeIfPresent migration rule — a
+    /// throwing or key-requiring decode would reset every existing install).
+    func testMusicGuidanceSettingsRoundTripAndDecodeLegacyBlobs() throws {
+        var s = MusicGenSettings()
+        s.cfgScale = 7.5
+        s.negativePrompt = "live audience noise"
+        s.apg = 0.25
+        let data = try JSONEncoder().encode(s)
+        let back = try JSONDecoder().decode(MusicGenSettings.self, from: data)
+        XCTAssertEqual(back.cfgScale, 7.5)
+        XCTAssertEqual(back.negativePrompt, "live audience noise")
+        XCTAssertEqual(back.apg, 0.25)
+
+        var legacy = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        legacy.removeValue(forKey: "cfgScale")
+        legacy.removeValue(forKey: "negativePrompt")
+        legacy.removeValue(forKey: "apg")
+        let old = try JSONSerialization.data(withJSONObject: legacy)
+        let fromOld = try JSONDecoder().decode(MusicGenSettings.self, from: old)
+        XCTAssertEqual(fromOld.cfgScale, 1.0, "guidance off — the reference default")
+        XCTAssertEqual(fromOld.negativePrompt, "")
+        XCTAssertEqual(fromOld.apg, 1.0, "full APG — the reference default")
+    }
+
     func testReferenceAudioIsDeclaredPerFamilyAndSentOnlyThere() {
         // ACE-Step has a timbre slot; Music 3 names `ref_audio` a 400. The
         // preset flag gates the control AND the field, so a clip left behind

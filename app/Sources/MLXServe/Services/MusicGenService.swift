@@ -107,6 +107,20 @@ final class MusicGenService: ObservableObject {
                 break
             }
         }
+        // Stage-2 guidance is Stable Audio 3's alone — the other families
+        // name `cfg_scale`/`negative_prompt`/`apg` a 400 — and the server
+        // refuses a negative prompt beside cfg_scale == 1.0 (guidance off
+        // means no uncond branch), so the fields are gated AND paired here:
+        // sticky negative text must not travel while the slider sits at 1.0.
+        if request.model.supportsGuidance {
+            let cfg = request.cfgScale
+            body["cfg_scale"] = cfg
+            if cfg != 1.0 {
+                body["apg"] = min(max(request.apg, 0), 1)
+                let neg = request.negativePrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !neg.isEmpty { body["negative_prompt"] = neg }
+            }
+        }
         // -1 = fresh random seed, resolved HERE so the log can show it.
         body["seed"] = request.seed >= 0 ? request.seed : Int.random(in: 0..<1_000_000_000)
         return body
@@ -157,6 +171,16 @@ final class MusicGenService: ObservableObject {
                 lines.append("cover_noise_strength: \(request.coverNoiseStrength)")
             } else if !request.trackClasses.isEmpty {
                 lines.append("track_classes: \(request.trackClasses.joined(separator: ", "))")
+            }
+        }
+        if request.model.supportsGuidance {
+            lines.append("cfg_scale: \(request.cfgScale)")
+            // Pairing mirrors the body: an omitted field must not be recorded
+            // as sent, or the sidecar claims a run that never happened.
+            if request.cfgScale != 1.0 {
+                lines.append("apg: \(min(max(request.apg, 0), 1))")
+                let neg = request.negativePrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !neg.isEmpty { lines.append("negative_prompt: \(neg)") }
             }
         }
         var out = lines.joined(separator: "\n")
