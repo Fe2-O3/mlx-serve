@@ -1381,6 +1381,9 @@ pub const Dit = struct {
         const E: c_int = @intCast(cfg.embed_dim);
         const mem: c_int = @intCast(cfg.num_memory_tokens);
         const ld: c_int = @intCast(cfg.local_add_cond_dim);
+        // B > 1 only happens on the CFG path (batched cond+uncond); every
+        // shape below derives from it, mirroring dit_mlx_medium's `B = x.shape[0]`.
+        const B: c_int = mlx.getShape(x)[0];
         const T: c_int = mlx.getShape(x)[2];
 
         // ── cond projections ──
@@ -1428,7 +1431,7 @@ pub const Dit = struct {
             defer _ = mlx.mlx_array_free(f2);
             const freqs = try mulScalar(f2, 3.141592653589793, s);
             defer _ = mlx.mlx_array_free(freqs);
-            const tsh = [_]c_int{ 1, 1 };
+            const tsh = [_]c_int{ B, 1 };
             const t2 = try reshape(t, &tsh, s);
             defer _ = mlx.mlx_array_free(t2);
             const args = try mulA(t2, freqs, s);
@@ -1464,7 +1467,7 @@ pub const Dit = struct {
 
         // ── local inpaint buffer: zeros at INPUT length (reference rule) ──
         const local_buf = if (local) |l| l else blk: {
-            const lsh = [_]c_int{ 1, T, ld };
+            const lsh = [_]c_int{ B, T, ld };
             var z = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_zeros(&z, &lsh, 3, .float32, s));
             break :blk z;
@@ -1478,7 +1481,12 @@ pub const Dit = struct {
             var m = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_expand_dims(&m, try getW(w, "transformer.memory_tokens"), 0, s));
             defer _ = mlx.mlx_array_free(m);
-            break :blk try concatA(m, p, 1, s);
+            // reference: broadcast_to(memory_tokens[None], (B, mem, E))
+            const msh = [_]c_int{ B, mem, E };
+            var mb = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_broadcast_to(&mb, m, &msh, 3, s));
+            defer _ = mlx.mlx_array_free(mb);
+            break :blk try concatA(mb, p, 1, s);
         };
         defer _ = mlx.mlx_array_free(seq);
 
@@ -1494,7 +1502,7 @@ pub const Dit = struct {
         for (0..cfg.depth) |i| {
             const lem = try ditLocalEmbed(a, w, i, local_buf, s);
             defer _ = mlx.mlx_array_free(lem);
-            const psh = [_]c_int{ 1, mem, E };
+            const psh = [_]c_int{ B, mem, E };
             var pad = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_zeros(&pad, &psh, 3, mlx.mlx_array_dtype(lem), s));
             defer _ = mlx.mlx_array_free(pad);
@@ -1509,7 +1517,7 @@ pub const Dit = struct {
         const stripped = blk: {
             const seq_len: c_int = mlx.getShape(seq)[1];
             const lo = [_]c_int{ 0, mem, 0 };
-            const hi = [_]c_int{ 1, seq_len, E };
+            const hi = [_]c_int{ B, seq_len, E };
             const stp = [_]c_int{ 1, 1, 1 };
             var o = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_slice(&o, seq, &lo, 3, &hi, 3, &stp, 3, s));
@@ -1633,6 +1641,41 @@ test "stable_audio3 oracle: conditioner cross_attn + global_cond match reference
     try assertParity(out.global_cond, ref_glob, "cond global", 0.999, 0.01, st);
 }
 
+// ── CFG (stage 2; reference = sa3_mlx.py model_fn CFG branch, ~line 736) ────
+
+test "stable_audio3 oracle: negative-prompt cross_attn matches reference" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const dir = try sa3ModelDir();
+    const fix = try fixturesDir();
+    const st = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(st);
+
+    const ids = try readRawI32(io, a, fix, "ids_neg.i32.raw");
+    defer a.free(ids);
+    const mask = try readRawI32(io, a, fix, "mask_neg.i32.raw");
+    defer a.free(mask);
+    const ref_cross = try readRawF32(io, a, fix, "cross_attn_neg.f32.raw");
+    defer a.free(ref_cross);
+    const seconds = try readMetaSeconds(io, a, fix);
+
+    // full conditioning path for the uncond branch: T5 on NEG_PROMPT, then
+    // the SAME padding + seconds-token concat the positive prompt gets.
+    var enc = try T5Gemma.load(io, a, dir);
+    defer enc.deinit();
+    const hidden = try enc.encode(a, ids, mask, enc.s);
+    defer _ = mlx.mlx_array_free(hidden);
+    const h16 = try astype(hidden, .float16, st);
+    defer _ = mlx.mlx_array_free(h16);
+
+    var w = try loadFileWeights(a, dir, "dit.safetensors");
+    defer w.deinit();
+    const out = try conditionPrompt(&w, h16, mask, seconds, st);
+    defer out.deinit();
+    try assertParity(out.cross, ref_cross, "neg cross", 0.999, 0.01, st);
+}
+
 // ── DiT oracle ──────────────────────────────────────────────────────────────
 
 test "stable_audio3 oracle: DiT velocity taps match reference" {
@@ -1696,6 +1739,76 @@ test "stable_audio3 oracle: DiT velocity taps match reference" {
     }
 }
 
+test "stable_audio3 oracle: CFG velocity taps match reference (apg branches + zero uncond)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const dir = try sa3ModelDir();
+    const fix = try fixturesDir();
+    const st = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(st);
+
+    const x0_raw = try readRawF32(io, a, fix, "x0.f32.raw");
+    defer a.free(x0_raw);
+    const cross_raw = try readRawF32(io, a, fix, "cross_attn.f32.raw");
+    defer a.free(cross_raw);
+    const neg_raw = try readRawF32(io, a, fix, "cross_attn_neg.f32.raw");
+    defer a.free(neg_raw);
+    const glob_raw = try readRawF32(io, a, fix, "global_cond.f32.raw");
+    defer a.free(glob_raw);
+
+    var dit = try Dit.load(io, a, dir);
+    defer dit.deinit();
+
+    const T: u32 = @intCast(x0_raw.len / 256);
+    const x0_32 = mlx.mlx_array_new_data(x0_raw.ptr, &[_]c_int{ 1, 256, @intCast(T) }, 3, .float32);
+    defer _ = mlx.mlx_array_free(x0_32);
+    const x0 = try astype(x0_32, .float16, st);
+    defer _ = mlx.mlx_array_free(x0);
+    const cross_32 = mlx.mlx_array_new_data(cross_raw.ptr, &[_]c_int{ 1, 257, 768 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(cross_32);
+    const cross = try astype(cross_32, .float16, st);
+    defer _ = mlx.mlx_array_free(cross);
+    const neg_32 = mlx.mlx_array_new_data(neg_raw.ptr, &[_]c_int{ 1, 257, 768 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(neg_32);
+    const cross_neg = try astype(neg_32, .float16, st);
+    defer _ = mlx.mlx_array_free(cross_neg);
+    const glob_32 = mlx.mlx_array_new_data(glob_raw.ptr, &[_]c_int{ 1, 768 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(glob_32);
+    const glob = try astype(glob_32, .float16, st);
+    defer _ = mlx.mlx_array_free(glob);
+
+    // zeros uncond — sa3_mlx.py's mx.zeros_like(cross_attn) arm.
+    const zsh = [_]c_int{ 1, 257, 768 };
+    var zeros_cross = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_zeros(&zeros_cross, &zsh, 3, .float16, st));
+    defer _ = mlx.mlx_array_free(zeros_cross);
+
+    // (file, label, cfg, apg, negative prompt, t) — one fixture per formula
+    // branch: full APG at two t's, vanilla, the intermediate blend, zeros.
+    const taps = [_]struct { file: []const u8, label: []const u8, cfg: f32, apg: f32, neg: bool, tv: f32 }{
+        .{ .file = "cfg_v_apg1_t01.f32.raw", .label = "cfg apg=1 t=0.1", .cfg = 3.0, .apg = 1.0, .neg = true, .tv = 0.1 },
+        .{ .file = "cfg_v_apg1_t09.f32.raw", .label = "cfg apg=1 t=0.9", .cfg = 3.0, .apg = 1.0, .neg = true, .tv = 0.9 },
+        .{ .file = "cfg_v_apg0_t05.f32.raw", .label = "cfg apg=0 t=0.5", .cfg = 3.0, .apg = 0.0, .neg = true, .tv = 0.5 },
+        .{ .file = "cfg_v_apg05_t05.f32.raw", .label = "cfg apg=0.5 t=0.5", .cfg = 3.0, .apg = 0.5, .neg = true, .tv = 0.5 },
+        .{ .file = "cfg_v_zerouncond_t05.f32.raw", .label = "cfg zero-uncond t=0.5", .cfg = 3.0, .apg = 1.0, .neg = false, .tv = 0.5 },
+    };
+    for (taps) |tap| {
+        const ref = try readRawF32(io, a, fix, tap.file);
+        defer a.free(ref);
+        const tv = tap.tv;
+        const t_arr = mlx.mlx_array_new_data(&tv, &[_]c_int{1}, 1, .float32);
+        defer _ = mlx.mlx_array_free(t_arr);
+        const v = try cfgVelocity(a, &dit, x0, t_arr, cross, glob, .{
+            .cfg = tap.cfg,
+            .apg = tap.apg,
+            .null_cross = if (tap.neg) cross_neg else zeros_cross,
+        }, st);
+        defer _ = mlx.mlx_array_free(v);
+        try assertParity(v, ref, tap.label, 0.999, 0.01, st);
+    }
+}
+
 // ── Ping-pong sampler (reference = sa3_pipeline.sample_flow_pingpong) ──
 //
 // t math runs on the host in f32 — the same IEEE ops the reference does on
@@ -1743,11 +1856,156 @@ fn scalarIn(dtype: mlx.mlx_dtype, v: f64, s: S) !mlx.mlx_array {
     _ = s;
 }
 
+/// CFG inputs for the sampler (sa3_mlx.py model_fn CFG branch).
+pub const Guidance = struct {
+    cfg: f32,
+    apg: f32,
+    /// Uncond-branch cross_attn [1, S+1, 768] — the negative prompt's
+    /// conditioning, or zeros_like(cross) when no negative prompt is set.
+    /// Borrowed: the caller owns it and frees it after sampling.
+    null_cross: mlx.mlx_array,
+};
+
+/// zeros_like(cross) — the uncond branch when no negative prompt is set
+/// (sa3_mlx.py: `null_cross_attn = mx.zeros_like(cross_attn)`).
+fn zerosLikeCross(cross: mlx.mlx_array, s: S) !mlx.mlx_array {
+    const csh = mlx.getShape(cross);
+    var z = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_zeros(&z, csh.ptr, csh.len, mlx.mlx_array_dtype(cross), s));
+    return z;
+}
+
+/// sa3_mlx.py ~736-762, verbatim math: one batched cond+uncond forward over
+/// cat([x, x]); the blend happens in DENOISED space (RF: d = x − σ·v with
+/// σ = t), optionally projecting the CFG difference orthogonal to cond_d
+/// (APG), then converts back to velocity in x's dtype. `t` is the sampler's
+/// [1] f32 sigma. Returns an owned velocity for the batch-1 `x`.
+fn cfgVelocity(
+    a: std.mem.Allocator,
+    dit: *const Dit,
+    x: mlx.mlx_array,
+    t: mlx.mlx_array,
+    cross: mlx.mlx_array,
+    global_cond: mlx.mlx_array,
+    g: Guidance,
+    s: S,
+) !mlx.mlx_array {
+    // ── batched forward: x2 [2,256,T], t2 [2], cross2 [2,S+1,768], g2 [2,768]
+    const x2 = try concatA(x, x, 0, s);
+    defer _ = mlx.mlx_array_free(x2);
+    const t2 = try concatA(t, t, 0, s);
+    defer _ = mlx.mlx_array_free(t2);
+    const cross2 = try concatA(cross, g.null_cross, 0, s);
+    defer _ = mlx.mlx_array_free(cross2);
+    const global2 = try concatA(global_cond, global_cond, 0, s);
+    defer _ = mlx.mlx_array_free(global2);
+    const vb = try dit.forward(a, x2, t2, cross2, global2, null, s);
+    defer _ = mlx.mlx_array_free(vb);
+    var parts = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(parts);
+    try mlx.check(mlx.mlx_split(&parts, vb, 2, 0, s));
+    var cond_v = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&cond_v, parts, 0));
+    defer _ = mlx.mlx_array_free(cond_v);
+    var uncond_v = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&uncond_v, parts, 1));
+    defer _ = mlx.mlx_array_free(uncond_v);
+
+    // ── denoised space, f32 (reference: `x.astype(f32) − v.astype(f32)·σ`)
+    const t32 = try astype(t, .float32, s);
+    defer _ = mlx.mlx_array_free(t32);
+    const sigma = try reshape(t32, &[_]c_int{ 1, 1, 1 }, s);
+    defer _ = mlx.mlx_array_free(sigma);
+    const x32 = try astype(x, .float32, s);
+    defer _ = mlx.mlx_array_free(x32);
+    const cv32 = try astype(cond_v, .float32, s);
+    defer _ = mlx.mlx_array_free(cv32);
+    const uv32 = try astype(uncond_v, .float32, s);
+    defer _ = mlx.mlx_array_free(uv32);
+    const cvm = try mulA(cv32, sigma, s);
+    defer _ = mlx.mlx_array_free(cvm);
+    const cond_d = try subA(x32, cvm, s);
+    defer _ = mlx.mlx_array_free(cond_d);
+    const uvm = try mulA(uv32, sigma, s);
+    defer _ = mlx.mlx_array_free(uvm);
+    const uncond_d = try subA(x32, uvm, s);
+    defer _ = mlx.mlx_array_free(uncond_d);
+    const diff = try subA(cond_d, uncond_d, s);
+    defer _ = mlx.mlx_array_free(diff);
+
+    // ── cfg_d = cond_d + (cfg − 1)·cfg_diff, per APG branch
+    const cfg_d = blk: {
+        if (g.apg <= 0.0) {
+            // vanilla CFG: cfg_diff = diff
+            const scaled = try mulScalar(diff, g.cfg - 1.0, s);
+            defer _ = mlx.mlx_array_free(scaled);
+            break :blk try addA(cond_d, scaled, s);
+        }
+        // APG: project diff onto the direction orthogonal to cond_d,
+        // per-sample over (C, T) — fp32 throughout (reference: same).
+        const sq = try mulA(cond_d, cond_d, s);
+        defer _ = mlx.mlx_array_free(sq);
+        var sum1 = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_sum_axis(&sum1, sq, 1, true, s));
+        defer _ = mlx.mlx_array_free(sum1);
+        var sum2 = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_sum_axis(&sum2, sum1, 2, true, s));
+        defer _ = mlx.mlx_array_free(sum2);
+        var norm = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_sqrt(&norm, sum2, s));
+        defer _ = mlx.mlx_array_free(norm);
+        const floor = try scalarIn(.float32, 1e-8, s);
+        defer _ = mlx.mlx_array_free(floor);
+        var denom = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_maximum(&denom, norm, floor, s));
+        defer _ = mlx.mlx_array_free(denom);
+        const unit = try divA(cond_d, denom, s);
+        defer _ = mlx.mlx_array_free(unit);
+        const du = try mulA(diff, unit, s);
+        defer _ = mlx.mlx_array_free(du);
+        var du1 = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_sum_axis(&du1, du, 1, true, s));
+        defer _ = mlx.mlx_array_free(du1);
+        var par0 = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_sum_axis(&par0, du1, 2, true, s));
+        defer _ = mlx.mlx_array_free(par0);
+        const parallel = try mulA(par0, unit, s);
+        defer _ = mlx.mlx_array_free(parallel);
+        const diff_orth = try subA(diff, parallel, s);
+        defer _ = mlx.mlx_array_free(diff_orth);
+        if (g.apg >= 1.0) {
+            const scaled = try mulScalar(diff_orth, g.cfg - 1.0, s);
+            defer _ = mlx.mlx_array_free(scaled);
+            break :blk try addA(cond_d, scaled, s);
+        }
+        // 0 < apg < 1: cfg_diff = apg·diff_orth + (1 − apg)·diff
+        const p1 = try mulScalar(diff_orth, g.apg, s);
+        defer _ = mlx.mlx_array_free(p1);
+        const p0 = try mulScalar(diff, 1.0 - g.apg, s);
+        defer _ = mlx.mlx_array_free(p0);
+        const blend = try addA(p1, p0, s);
+        defer _ = mlx.mlx_array_free(blend);
+        const scaled = try mulScalar(blend, g.cfg - 1.0, s);
+        defer _ = mlx.mlx_array_free(scaled);
+        break :blk try addA(cond_d, scaled, s);
+    };
+    defer _ = mlx.mlx_array_free(cfg_d);
+
+    // ── back to velocity: cfg_v = (x − cfg_d)/σ in x's dtype
+    const num = try subA(x32, cfg_d, s);
+    defer _ = mlx.mlx_array_free(num);
+    const v32 = try divA(num, sigma, s);
+    defer _ = mlx.mlx_array_free(v32);
+    return astype(v32, mlx.mlx_array_dtype(x), s);
+}
+
 /// One rf_denoiser ping-pong loop. `sigmas` is the host schedule (len
 /// steps+1); `noises[k]` is the k-th redraw — drawn only while
 /// i < steps−1 && t_next > 0, so callers size it steps−1 for a healthy
 /// schedule (the engine passes MLX-random draws, the oracle fixtures).
-/// Returns `steps` latents; caller frees each plus the slice.
+/// `guidance` non-null swaps the per-step forward for the batched CFG
+/// denoiser (cfgVelocity). Returns `steps` latents; caller frees each plus
+/// the slice.
 pub fn samplePingPong(
     a: std.mem.Allocator,
     dit: *const Dit,
@@ -1756,6 +2014,7 @@ pub fn samplePingPong(
     noises: []const mlx.mlx_array,
     cross: mlx.mlx_array,
     global_cond: mlx.mlx_array,
+    guidance: ?Guidance,
     progress: ?sse.Progress,
     s: S,
 ) ![]mlx.mlx_array {
@@ -1776,7 +2035,10 @@ pub fn samplePingPong(
         // t_tensor: f32 [1] — sigmas are f32, so the model always sees f32 t.
         const t_ten = try scalarIn(.float32, t_curr, s);
         defer _ = mlx.mlx_array_free(t_ten);
-        const v = try dit.forward(a, cur, t_ten, cross, global_cond, null, s);
+        const v = if (guidance) |g|
+            try cfgVelocity(a, dit, cur, t_ten, cross, global_cond, g, s)
+        else
+            try dit.forward(a, cur, t_ten, cross, global_cond, null, s);
         defer _ = mlx.mlx_array_free(v);
 
         // denoised = x − t_curr.astype(x.dtype) * v
@@ -1888,7 +2150,7 @@ test "stable_audio3 oracle: ping-pong sampler latents match reference" {
         }
     };
 
-    const lats = try samplePingPong(a, &dit, x0, sig_raw, noises[0..], cross, glob, null, st);
+    const lats = try samplePingPong(a, &dit, x0, sig_raw, noises[0..], cross, glob, null, null, st);
     defer {
         for (lats) |l| _ = mlx.mlx_array_free(l);
         a.free(lats);
@@ -1904,6 +2166,83 @@ test "stable_audio3 oracle: ping-pong sampler latents match reference" {
         defer a.free(label);
         try assertParity(lat, ref, label, 0.999, 0.01, st);
     }
+}
+
+test "stable_audio3 oracle: ping-pong + CFG guidance final latent matches reference" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const dir = try sa3ModelDir();
+    const fix = try fixturesDir();
+    const st = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(st);
+
+    const x0_raw = try readRawF32(io, a, fix, "x0.f32.raw");
+    defer a.free(x0_raw);
+    const cross_raw = try readRawF32(io, a, fix, "cross_attn.f32.raw");
+    defer a.free(cross_raw);
+    const neg_raw = try readRawF32(io, a, fix, "cross_attn_neg.f32.raw");
+    defer a.free(neg_raw);
+    const glob_raw = try readRawF32(io, a, fix, "global_cond.f32.raw");
+    defer a.free(glob_raw);
+    const sig_raw = try readRawF32(io, a, fix, "sigmas.f32.raw");
+    defer a.free(sig_raw);
+    const ref_final = try readRawF32(io, a, fix, "latents_cfg_final.f32.raw");
+    defer a.free(ref_final);
+
+    var dit = try Dit.load(io, a, dir);
+    defer dit.deinit();
+
+    const T: u32 = @intCast(x0_raw.len / 256);
+    const x0_32 = mlx.mlx_array_new_data(x0_raw.ptr, &[_]c_int{ 1, 256, @intCast(T) }, 3, .float32);
+    defer _ = mlx.mlx_array_free(x0_32);
+    const x0 = try astype(x0_32, .float16, st);
+    defer _ = mlx.mlx_array_free(x0);
+    const cross_32 = mlx.mlx_array_new_data(cross_raw.ptr, &[_]c_int{ 1, 257, 768 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(cross_32);
+    const cross = try astype(cross_32, .float16, st);
+    defer _ = mlx.mlx_array_free(cross);
+    const neg_32 = mlx.mlx_array_new_data(neg_raw.ptr, &[_]c_int{ 1, 257, 768 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(neg_32);
+    const cross_neg = try astype(neg_32, .float16, st);
+    defer _ = mlx.mlx_array_free(cross_neg);
+    const glob_32 = mlx.mlx_array_new_data(glob_raw.ptr, &[_]c_int{ 1, 768 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(glob_32);
+    const glob = try astype(glob_32, .float16, st);
+    defer _ = mlx.mlx_array_free(glob);
+
+    // 7 redraws for 8 steps — same fixture chain as the plain sampler oracle
+    // (guidance changes v, not the schedule or the noise).
+    var noises: [7]mlx.mlx_array = undefined;
+    var noise_owned: [7]bool = undefined;
+    for (0..7) |k| {
+        const buf = try allocPrint_noise(a, k);
+        defer a.free(buf);
+        const raw = try readRawF32(io, a, fix, buf);
+        defer a.free(raw);
+        const n32 = mlx.mlx_array_new_data(raw.ptr, &[_]c_int{ 1, 256, @intCast(T) }, 3, .float32);
+        const arr = try astype(n32, .float16, st);
+        _ = mlx.mlx_array_free(n32);
+        noises[k] = arr;
+        noise_owned[k] = true;
+    }
+    defer for (noises, 0..) |n, k| {
+        if (noise_owned[k]) {
+            _ = mlx.mlx_array_free(n);
+        }
+    };
+
+    const lats = try samplePingPong(a, &dit, x0, sig_raw, noises[0..], cross, glob, .{
+        .cfg = 3.0,
+        .apg = 1.0,
+        .null_cross = cross_neg,
+    }, null, st);
+    defer {
+        for (lats) |l| _ = mlx.mlx_array_free(l);
+        a.free(lats);
+    }
+    try testing.expectEqual(@as(usize, 8), lats.len);
+    try assertParity(lats[7], ref_final, "cfg final latent", 0.999, 0.01, st);
 }
 
 fn allocPrint_noise(a: std.mem.Allocator, k: usize) ![]u8 {
@@ -2530,6 +2869,18 @@ pub const GenerateRequest = struct {
     seconds: f32 = 30.0,
     steps: u32 = 8,
     seed: u64 = 42,
+    /// CFG scale (sa3_mlx `--cfg`). 1.0 = off, the reference default: one
+    /// forward per step. Any other finite value runs the batched cond+uncond
+    /// pass (~2x per step) and blends in denoised space.
+    cfg_scale: f32 = 1.0,
+    /// CFG unconditional branch (sa3_mlx `--negative-prompt`). null (or "")
+    /// → the upstream default zeros_like(cross). Only read when
+    /// cfg_scale != 1.0 (no uncond branch exists otherwise).
+    negative_prompt: ?[]const u8 = null,
+    /// APG scale (sa3_mlx `--apg`) in [0,1] — only matters when
+    /// cfg_scale != 1.0. 1.0 = full projection (reference default),
+    /// 0.0 = vanilla CFG, in between blends.
+    apg: f32 = 1.0,
 };
 
 pub const Generated = struct {
@@ -2587,6 +2938,11 @@ pub const Engine = struct {
     pub fn generate(self: *Engine, allocator: std.mem.Allocator, req: GenerateRequest, progress: ?sse.Progress) !Generated {
         const seconds = std.math.clamp(@as(f64, req.seconds), 1.0, 384.0);
         const steps: usize = if (req.steps == 0) 8 else @intCast(req.steps);
+        // guidance: NaN/inf would silently engage the uncond branch (NaN != 1.0)
+        // and emit garbage audio — fail loud instead. apg clamps like seconds:
+        // the reference formula already treats <0 as 0 and >1 as 1.
+        if (!std.math.isFinite(req.cfg_scale)) return error.InvalidCfgScale;
+        const apg = std.math.clamp(req.apg, 0.0, 1.0);
 
         // tokenize; the reference truncates at prompt_max_len (256)
         const ids_full = try self.tok.encode(allocator, req.prompt);
@@ -2662,7 +3018,41 @@ pub const Engine = struct {
         }
         if (key_owned) _ = mlx.mlx_array_free(key_cur);
 
-        const lats = try samplePingPong(allocator, &self.dit, x0, sigmas, noises, cond.cross, cond.global_cond, progress, self.s);
+        // CFG uncond branch — built only when cfg != 1.0 (reference rule;
+        // no uncond pass exists otherwise). The negative prompt conditions
+        // exactly like the positive one (T5 → padding → same seconds token);
+        // absent/empty → zeros_like(cross), sa3_mlx.py's upstream default.
+        var guidance: ?Guidance = null;
+        var null_cross: ?mlx.mlx_array = null;
+        defer if (null_cross) |nc| {
+            _ = mlx.mlx_array_free(nc);
+        };
+        if (req.cfg_scale != 1.0) {
+            const nc: mlx.mlx_array = if (req.negative_prompt) |np| blk: {
+                if (np.len == 0) break :blk try zerosLikeCross(cond.cross, self.s);
+                const neg_ids_full = try self.tok.encode(allocator, np);
+                defer allocator.free(neg_ids_full);
+                const neg_n = @min(neg_ids_full.len, 256);
+                const neg_ids = try allocator.alloc(i32, neg_n);
+                defer allocator.free(neg_ids);
+                for (neg_ids_full[0..neg_n], neg_ids) |u, *i| i.* = @intCast(u);
+                var nmask: [256]i32 = @splat(0);
+                for (0..neg_n) |i| nmask[i] = 1;
+                const nh = try self.t5.encode(allocator, neg_ids, nmask[0..], self.t5.s);
+                defer _ = mlx.mlx_array_free(nh);
+                const nh16 = try astype(nh, .float16, self.s);
+                defer _ = mlx.mlx_array_free(nh16);
+                const ncond = try conditionPrompt(&self.dit.w, nh16, nmask[0..], @floatCast(seconds), self.s);
+                // seconds token is identical to the positive branch's;
+                // cond.global_cond stays the one the sampler uses.
+                _ = mlx.mlx_array_free(ncond.global_cond);
+                break :blk ncond.cross;
+            } else try zerosLikeCross(cond.cross, self.s);
+            null_cross = nc;
+            guidance = .{ .cfg = req.cfg_scale, .apg = apg, .null_cross = nc };
+        }
+
+        const lats = try samplePingPong(allocator, &self.dit, x0, sigmas, noises, cond.cross, cond.global_cond, guidance, progress, self.s);
         defer {
             for (lats) |l| _ = mlx.mlx_array_free(l);
             allocator.free(lats);
@@ -2843,4 +3233,42 @@ test "stable_audio3 oracle: end-to-end generation matches reference audio" {
     const arr = mlx.mlx_array_new_data(out.samples.ptr, &sh, 3, .float32);
     defer _ = mlx.mlx_array_free(arr);
     try assertParity(arr, ref, "e2e audio", 0.99, 0.05, st);
+}
+
+test "stable_audio3 oracle: end-to-end CFG generation matches reference audio" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const dir = try sa3ModelDir();
+    const fix = try fixturesDir();
+    const st = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(st);
+
+    var eng = try Engine.load(io, a, dir);
+    defer eng.deinit();
+    // same dequantize-for-test rule as the plain e2e (see above).
+    try dequantizeForTest(&eng.t5.w, st);
+    try dequantizeForTest(&eng.dit.w, st);
+
+    const out = try eng.generate(a, .{
+        .prompt = "A beautiful piano arpeggio grows into a cinematic climax",
+        .seconds = 15.0,
+        .steps = 8,
+        .seed = 1234,
+        .cfg_scale = 3.0,
+        // dump_stable_audio3_fixtures.NEG_PROMPT — must stay in sync.
+        .negative_prompt = "muffled, distorted, low quality, background noise",
+        .apg = 1.0,
+    }, null);
+    defer a.free(out.samples);
+
+    const ref = try readRawF32(io, a, fix, "audio_cfg.f32.raw");
+    defer a.free(ref);
+    const want: usize = 661500; // 15 s * 44100, same trim the reference applies
+    try testing.expectEqual(@as(usize, want * 2), out.samples.len);
+
+    const sh = [_]c_int{ 1, 2, @intCast(want) };
+    const arr = mlx.mlx_array_new_data(out.samples.ptr, &sh, 3, .float32);
+    defer _ = mlx.mlx_array_free(arr);
+    try assertParity(arr, ref, "e2e cfg audio", 0.99, 0.05, st);
 }
