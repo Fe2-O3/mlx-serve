@@ -39,7 +39,7 @@
 - **会说话的角色** —— 在视频提示词里用引号写出台词、附上一段真实的语音或音乐片段，或者为 Qwen3-TTS 输入一句台词让它配音 —— 视频会*围绕*这条音轨生成，表演与之同步，原始音频（不是重新合成）会进入 mp4。
 - **用几秒音频克隆音色** —— 在设置 ▸ 语音中录制或挑选一段片段，Qwen3-TTS 就用那个音色说话 —— 在 AudioGen 面板里、在免手操作语音模式里，处处如此。
 - **谱写完整的音乐曲目** —— ACE-Step 1.5 把一段风格提示词（以及可选歌词）变成 48 kHz 立体声曲目：一首 30 秒的歌约 4 秒渲染完成。
-- **按描述渲染声音** —— Stable Audio 3 Medium 把白话描述变成 44.1 kHz 的声音、氛围和器乐音乐。没有歌词或速度字段：一切信息都写进风格提示词。它的引导控件（CFG 强度、负面提示词、APG）只属于它 —— 其他音乐引擎会按名字拒绝这些字段。也可以给它一段**种子音频**而不是从纯噪声开始，它会把这段素材往你的提示词方向改写：**Seed noise** 滑块决定保留多少原始素材（1.00 等于重新生成，数值越低保留越多）。这两个字段同样只有 Stable Audio 3 读取。
+- **按描述渲染声音** —— Stable Audio 3 Medium 把白话描述变成 44.1 kHz 的声音、氛围和器乐音乐。没有歌词或速度字段：一切信息都写进风格提示词。它的引导控件（CFG 强度、负面提示词、APG）只属于它 —— 其他音乐引擎会按名字拒绝这些字段。也可以给它一段**种子音频**而不是从纯噪声开始，它会把这段素材往你的提示词方向改写：**Seed noise** 滑块决定保留多少原始素材（1.00 等于重新生成，数值越低保留越多）。打开 **Inpaint a range** 并用两个滑块选定秒数，就只重新生成这一段，片段其余部分原样保留。这些字段同样只有 Stable Audio 3 读取。
 - **把照片变成 3D 模型** —— Hunyuan3D-2.1 把一张图像转换成水密的 GLB 网格，可选带完整 PBR 纹理 —— 直接放进游戏引擎或切片软件。
 - **自带音轨的视频** —— MiniMax-H3（Hailuo 3.0）在一趟里同时对片段和立体声音轨去噪，因此声音是与视频一起生成的，而不是事后配音。先描述场景，再在 `overall_soundscape:` 后面写你想听到的声音。REF2VA 版本围绕你附上的图片、片段或音频构建片段（提示词中的 `<Picture 1>`、`<Video 1>`、`<Audio 1>`）；FL2VA 版本接受首 / 尾关键帧，并把多个窗口串成更长的片段。**Turbo** 用 4 步而不是 30 步渲染。两种方式都慢：1344×768、124 帧在 M4 Max 上约 50 分钟。
 - **风格 LoRA** —— 在运行时挂载 diffusers、kohya 或 PEFT 的 `.safetensors` 适配器，为 FLUX、Krea、Mage-Flow、LTX 或 MiniMax-H3 的生成换风格。一次最多 8 个，相加而不是合并，因此不会有任何东西被重新量化，基础权重零质量损失。每个适配器按它自己文件里声明的强度运行。
@@ -51,7 +51,7 @@
 | 图像 | FLUX.2-klein 4B 4-bit（mflux，预量化约 5 GB） | FLUX.2-klein 9B（10 GB）、Krea-2-Turbo、Mage-Flow Turbo / Edit 8-bit（8.5 / 9.1 GB） | 8 / 12 / 16 GB |
 | 视频 | LTX-Video 2.5 4-bit（36 GB，自带文本编码器） | LTX-Video 2.5 8-bit（59 GB，更锐利 + 扩散解码器）、LTX-Video 2.3 Q4（约 50 GB）、MiniMax-H3（Hailuo 3.0）4-bit / 8-bit，一趟同时生成视频**和**匹配的音轨 | LTX 24 GB RAM；H3 26 GB（40 GB）或 44 GB（69 GB） |
 | 语音 | Qwen3-TTS 1.7b（语音克隆） | Qwen3-TTS 0.6b、Kokoro-82M（54 种音色，约 345 MB） | 8 GB RAM，首次运行约 3.5 GB 下载 |
-| 音乐 | ACE-Step 1.5 XL Turbo 8-bit（快，8 步） | MiniMax Music 3 8-bit（演唱你的歌词，歌曲最长 6 min，人声最强）、Stable Audio 3 Medium 8-bit（文生音频：声音与音乐，本地转换） | ACE 8 GB RAM，约 6.2 GB 下载；Music 3 约 20 GB RAM，13.6 GB 下载；Stable Audio 3 约 6 GB RAM |
+| 音乐 | ACE-Step 1.5 XL Turbo 8-bit（快，8 步） | MiniMax Music 3 8-bit（演唱你的歌词，歌曲最长 6 min，人声最强）、Stable Audio 3 Medium 8-bit（文生音频、以种子片段做音频生音频、区间局部重绘，本地转换） | ACE 8 GB RAM，约 6.2 GB 下载；Music 3 约 20 GB RAM，13.6 GB 下载；Stable Audio 3 约 6 GB RAM |
 | 3D | Hunyuan3D-2.1 8-bit（形状 + PBR 纹理） | — | 16 GB RAM |
 
 > 41 GB 的 LTX 2.3 快照**同时**带有两种 transformer 变体（1 阶段蒸馏版 + 2 阶段 dev 版，每个约 11 GB）外加一个 7.6 GB 的蒸馏 LoRA，因此你可以在 Fast/Good/Quality/Super 之间离线切换，无需重新下载。
