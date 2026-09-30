@@ -50,6 +50,18 @@ Fixture taps (all under --out, default ~/claude-tmp/sa3/fixtures):
   patches_TNN.f32.raw    decoder output for the arms in meta.decode
   audio_TNN.f32.raw      [1,2,S]      patched + trimmed stereo (production arm)
   audio_cfg.f32.raw      [1,2,S]      the CFG run decoded (e2e oracle)
+  sigmas_smax05.f32.raw  [steps+1]    schedule with σmax=0.5 (logsnr warp
+                                      re-anchored to σmax, sa3_pipeline:90)
+  init_pcm_pad/trim.f32.raw [1,2,S]   deterministic init-WAV PCM: one shorter
+                                      than the target (zero-pad path), one
+                                      longer (trim path)
+  enc_mapped.f32.raw     [1,T*17,1536] encoder taps: mapping + new-token regroup
+  enc_block6.f32.raw     [1,T*17,1536] … and after 6 of the 12 blocks
+  init_latents_pad/trim.f32.raw [1,256,T] SAME-L encoder output (f32 softnorm;
+                                      the run casts f16 before the init mix)
+  x0_a2a.f32.raw         [1,256,T]    init*(1-σ) + noise*σ mixed sampler input
+  latents_a2a_final.f32.raw [1,256,T] final latent of the audio-to-audio run
+  audio_a2a.f32.raw      [1,2,S]      the a2a run decoded (e2e oracle)
   meta.json              shapes, seeds, dispatch, tokenizer cross-check
 
 Then:  export SA3_TEST_MODEL=<pack> SA3_FIXTURES=<out>  and run the Zig
@@ -57,6 +69,7 @@ oracle tests once `src/stable_audio3.zig` exists.
 """
 
 import argparse
+import importlib
 import json
 import math
 import os
@@ -100,6 +113,17 @@ CFG_TAPS = (
     ("cfg_v_zerouncond_t05", 3.0, 1.0, False, 0.5),
 )
 CFG_RUN = (3.0, 1.0)  # (cfg, apg) of the full 8-step sampled run + audio_cfg
+
+# Stage-3 (audio-to-audio) ground truth: sa3_mlx.py --init-audio +
+# --init-noise-level. σmax drives BOTH the schedule (logsnr-warped linspace
+# re-anchored to σmax) and the init mix: noise = init*(1-σ) + x0*σ (line 705).
+A2A_SIGMA_MAX = 0.5
+# Two deterministic init WAVs' post-decode PCM: one SHORTER than the target
+# (zero-pad path) and one LONGER (trim path) — sa3_mlx.py:641-682 pads or
+# trims to enc_T_lat * 4096 samples before patching. SAME-L's pad_mod 16
+# makes enc_T_lat == T_lat for every T_lat, so only the sample count moves.
+A2A_PAD_SAMPLES = 500000   # 11.34 s < the 15.05 s target → pad 163552
+A2A_TRIM_SAMPLES = 700000  # 15.87 s > the 15.05 s target → trim 36448
 
 
 def log(msg):
@@ -190,6 +214,14 @@ def prepare_decoder_npz(pack, scratch):
     """SAME-L decoder ships fp32 verbatim in the pack — copy, no dequant."""
     arrays = dequantized_pack_arrays(os.path.join(pack, "same_l_decoder.safetensors"), 8)
     path = os.path.join(scratch, "same_l_decoder_pack.npz")
+    write_ref_npz(path, arrays)
+    return path
+
+
+def prepare_encoder_npz(pack, scratch):
+    """SAME-L encoder ships fp32 verbatim in the pack — copy, no dequant."""
+    arrays = dequantized_pack_arrays(os.path.join(pack, "same_l_encoder_f32.safetensors"), 8)
+    path = os.path.join(scratch, "same_l_encoder_pack.npz")
     write_ref_npz(path, arrays)
     return path
 
@@ -302,6 +334,17 @@ def main(argv=None):
     import dit_mlx_medium as dit_mod
     import same_l_decoder as dec_mod
 
+    # same_l_encoder.py starts with a package-relative `from .same_l_decoder
+    # import …`, so importing it top-level fails. Import it as a child of a
+    # namespace package named after --ref: the flat copy then satisfies the
+    # relative import against its own same_l_decoder.py (a second, stateless
+    # module instance of the same code — pure math, no shared state).
+    ref_parent, ref_pkg = os.path.split(os.path.abspath(args.ref.rstrip("/")))
+    if not ref_pkg.isidentifier():
+        raise SystemExit(f"[FATAL] --ref basename must be an identifier, got {ref_pkg!r}")
+    sys.path.insert(0, ref_parent)
+    enc_mod = importlib.import_module(f"{ref_pkg}.same_l_encoder")
+
     seconds = args.seconds
     steps = STEPS
     seed = SEED
@@ -330,7 +373,7 @@ def main(argv=None):
 
     # ── 1. tokenize — SentencePiece proto is ground truth; assert the pack's
     # tokenizer.json agrees, because that is the file Zig reads.
-    log("stage 1/6  tokenize")
+    log("stage 1/7  tokenize")
     with np.load(os.path.join(args.npz, "t5gemma_f16.npz")) as z:
         sp = spm.SentencePieceProcessor()
         sp.LoadFromSerializedProto(z["TOKENIZER_MODEL"].tobytes())
@@ -357,7 +400,7 @@ def main(argv=None):
 
     # ── 2. T5Gemma forward (empty prompt takes the reference's own special
     # path: one visible position during the forward, mask restored after).
-    log("stage 2/6  T5Gemma")
+    log("stage 2/7  T5Gemma")
     t5_npz = prepare_t5gemma_npz(args.pack, args.npz, bits, args.scratch)
     enc = t5g.T5Gemma.from_npz(t5_npz)
     hidden_cond, _ = enc.encode([PROMPT], max_len=256)
@@ -365,7 +408,7 @@ def main(argv=None):
     mx.eval(hidden_cond, hidden_empty)
 
     # ── 3. conditioning: padding + seconds token.
-    log("stage 3/6  conditioning")
+    log("stage 3/7  conditioning")
     dit_npz = prepare_dit_npz(args.pack, bits, args.scratch)
     padding_emb, secs = pipe.load_conditioner_from_npz(dit_npz, prefix="cond.")
     dtype = mx.float16  # sa3_mlx.py --dit-dtype fp16 default
@@ -385,7 +428,7 @@ def main(argv=None):
     mx.eval(cross, global_cond, cross_neg)
 
     # ── 4. DiT velocity probes + sampler inputs.
-    log("stage 4/6  DiT")
+    log("stage 4/7  DiT")
     dit = dit_mod.load_dit(dit_npz, T_lat=T_lat, dtype=dtype, compile_=False)
     key = mx.random.key(seed)
     x0 = mx.random.normal((1, 256, T_lat), dtype=dtype, key=key)
@@ -413,7 +456,7 @@ def main(argv=None):
 
     # ── 5. sampler: 8 ping-pong steps, cross-checked against the reference
     # function (my exposed loop must land exactly where theirs does).
-    log("stage 5/6  sampler")
+    log("stage 5/7  sampler")
     sigmas = pipe.build_pingpong_schedule(steps, sigma_max=1.0, use_logsnr_shift=True)
 
     def model_fn(x, t):
@@ -443,7 +486,7 @@ def main(argv=None):
 
     # ── 6. decode: production arm (chunked when T_lat > kernel 144) plus the
     # two short/odd arms of sa3_mlx.py's dispatch.
-    log("stage 6/6  decode")
+    log("stage 6/7  decode")
     dec_npz = prepare_decoder_npz(args.pack, args.scratch)
     decoder = dec_mod.load_model(weights_path=dec_npz, dtype=mx.float32)
     latents_final = latents[-1].astype(mx.float32)
@@ -485,6 +528,118 @@ def main(argv=None):
     decode_arms["t7_chunk2"] = "chunked(chunk=2, ovl=2), T_lat=7"
     meta["decode"] = decode_arms
 
+    # ── 7. audio-to-audio: SAME-L encoder + σmax schedule + init mix + a full
+    # run (sa3_mlx.py stage 3a/3b with --init-audio --init-noise-level=0.5).
+    log("stage 7/7  audio-to-audio")
+    sigmas_a2a = pipe.build_pingpong_schedule(steps, sigma_max=A2A_SIGMA_MAX, use_logsnr_shift=True)
+    mx.eval(sigmas_a2a)
+
+    enc_npz = prepare_encoder_npz(args.pack, args.scratch)
+    encoder = enc_mod.load_model(weights_path=enc_npz, dtype=mx.float32)
+    target_samples = T_lat * SAMPLES_PER_LATENT
+
+    def init_pcm(n_samples):
+        """Deterministic stereo WAV content, int16-quantized like a real file.
+
+        sa3_mlx.read_wav converts int16 with `/32767` and duplicates mono to
+        stereo — the PCM below is what the engine must see after decoding.
+        """
+        tt = np.arange(n_samples, dtype=np.float64) / SAMPLE_RATE
+        rng = np.random.default_rng(4321)
+        mix = (0.4 * np.sin(2 * np.pi * (220.0 + 110.0 * np.sin(2 * np.pi * 0.125 * tt)) * tt)
+               + 0.15 * rng.standard_normal(n_samples))
+        pcm16 = np.clip(np.round(mix * 32767.0), -32767, 32767).astype(np.int16)
+        f = pcm16.astype(np.float32) / 32767.0
+        return np.stack([f, f], axis=0)[None, ...]  # (1, 2, T)
+
+    def encode_init(pcm_np):
+        """sa3_mlx.py:641-682 — trim/pad to the target, patch, encode, trim."""
+        t_in = pcm_np.shape[-1]
+        if t_in >= target_samples:
+            audio = pcm_np[..., :target_samples]
+            action = f"trim {t_in - target_samples} samples"
+        else:
+            pad = target_samples - t_in
+            audio = np.pad(pcm_np, ((0, 0), (0, 0), (0, pad)))
+            action = f"zero-pad {pad} samples"
+        # patch_audio: rearrange("b c (l h) -> b (c h) l", h=256)
+        patches = (np.reshape(audio, (1, 2, -1, 256))
+                     .transpose(0, 1, 3, 2)
+                     .reshape(1, 512, -1))
+        assert patches.shape[-1] % 16 == 0, patches.shape
+        lat = encoder(mx.array(patches))[..., :T_lat]
+        mx.eval(lat)
+        return lat.astype(mx.float32), action, patches
+
+    def encode_with_taps(patches_np):
+        """SAMELEncoder.__call__ (same_l_encoder.py:77-111) copied to expose
+        the mapping/regroup and a mid-stack tap; verified against the real
+        method below so the copy cannot drift from what produced the run."""
+        patches = mx.array(patches_np)
+        b, c, t_aud = patches.shape
+        assert c == 512 and t_aud % 16 == 0
+        x = encoder.mapping(patches.transpose(0, 2, 1))          # (b, t_aud, 1536)
+        taps = {}
+        t_lat_e = int(t_aud) // 16
+        x = x.reshape(b * t_lat_e, 16, x.shape[-1])
+        nt = mx.broadcast_to(encoder.new_tokens, (b * t_lat_e, 1, x.shape[-1]))
+        x = mx.concatenate([x, nt], axis=1).reshape(b, t_lat_e * 17, x.shape[-1])
+        taps["enc_mapped"] = x
+        mask = enc_mod._SWA_MASK.astype(x.dtype)
+        for i, blk in enumerate(encoder.blocks):
+            x = blk(x, mask=mask)
+            if i == 5:
+                taps["enc_block6"] = x
+        x = x.reshape(b, t_lat_e, 17, x.shape[-1])[:, :, -1, :]
+        x = encoder.project_out(x).transpose(0, 2, 1)
+        out = x * encoder.scaling_factor + encoder.bias
+        out = out / encoder.running_std
+        return out, taps
+
+    pcm_pad = init_pcm(A2A_PAD_SAMPLES)
+    pcm_trim = init_pcm(A2A_TRIM_SAMPLES)
+    init_pad, act_pad, _ = encode_init(pcm_pad)
+    init_trim, act_trim, patches_trim = encode_init(pcm_trim)
+    log(f"  encoder: pad({act_pad}) trim({act_trim}) -> latents {init_trim.shape}")
+    enc_ref, enc_taps = encode_with_taps(patches_trim)
+    mx.eval(enc_ref, init_trim)
+    # Both sides are the encoder's own f32 output (the reference method vs
+    # the tap-exposing copy) — comparing against an f16-cast would measure
+    # f16 rounding (~4e-3), not a logic difference.
+    copy_delta = float(mx.abs(enc_ref - init_trim).max())
+    if copy_delta > 1e-5:
+        raise SystemExit(f"[FATAL] encode_with_taps copy diverges from the "
+                         f"reference method: max|diff| = {copy_delta}")
+
+    # sa3_mlx.py:705 — init mix: `init.astype(dtype)` (f16) against the f16
+    # x0 drawn at stage 4 from the same key, exactly as the reference mixes.
+    x0_a2a = init_trim.astype(mx.float16) * (1.0 - A2A_SIGMA_MAX) + x0 * A2A_SIGMA_MAX
+    mx.eval(x0_a2a)
+    # reload — the probes freed the model to keep peak RAM honest
+    dit = dit_mod.load_dit(dit_npz, T_lat=T_lat, dtype=dtype, compile_=False)
+    latents_a2a, _ = sample_loop(model_fn, x0_a2a, sigmas_a2a, seed + 1)
+    latents_a2a_final = latents_a2a[-1].astype(mx.float32)
+    mx.eval(latents_a2a_final)
+    log("  a2a run done (init mix + smax schedule, cfg=1)")
+    if T_lat > 128 + 2 * 8:
+        patches_a2a = dec_mod.decode_chunked(decoder, latents_a2a_final, 128, 8)
+    else:
+        patches_a2a = decoder(latents_a2a_final)
+    mx.eval(patches_a2a)
+    audio_a2a = pipe.patched_decode(patches_a2a, patch_size=256, channels=2)
+    audio_a2a = audio_a2a[..., : int(round(seconds * SAMPLE_RATE))]
+    mx.eval(audio_a2a)
+    del dit, encoder
+    mx.clear_cache() if hasattr(mx, "clear_cache") else None
+
+    meta["a2a"] = {
+        "sigma_max": A2A_SIGMA_MAX,
+        "target_samples": target_samples,
+        "pad_pcm": {"samples": A2A_PAD_SAMPLES, "action": act_pad},
+        "trim_pcm": {"samples": A2A_TRIM_SAMPLES, "action": act_trim},
+        "run": "init=trim PCM, mixed x0, σmax schedule, seed+1 redraw chain, cfg=1",
+    }
+
     # ── dump
     log(f"dump -> {args.out}")
     f32 = lambda a: np.asarray(np.array(a), dtype=np.float32)  # noqa: E731
@@ -517,6 +672,16 @@ def main(argv=None):
         dump(args.out, f"{name}.f32.raw", f32(v), meta, dtype="f32")
     dump(args.out, "latents_cfg_final.f32.raw", f32(latents_cfg_final), meta, dtype="f32")
     dump(args.out, "audio_cfg.f32.raw", f32(audio_cfg), meta, dtype="f32")
+    dump(args.out, "sigmas_smax05.f32.raw", f32(sigmas_a2a), meta, dtype="f32")
+    dump(args.out, "init_pcm_pad.f32.raw", f32(pcm_pad), meta, dtype="f32")
+    dump(args.out, "init_pcm_trim.f32.raw", f32(pcm_trim), meta, dtype="f32")
+    dump(args.out, "enc_mapped.f32.raw", f32(enc_taps["enc_mapped"]), meta, dtype="f32")
+    dump(args.out, "enc_block6.f32.raw", f32(enc_taps["enc_block6"]), meta, dtype="f32")
+    dump(args.out, "init_latents_pad.f32.raw", f32(init_pad), meta, dtype="f32")
+    dump(args.out, "init_latents_trim.f32.raw", f32(init_trim), meta, dtype="f32")
+    dump(args.out, "x0_a2a.f32.raw", f32(x0_a2a), meta, dtype="f32")
+    dump(args.out, "latents_a2a_final.f32.raw", f32(latents_a2a_final), meta, dtype="f32")
+    dump(args.out, "audio_a2a.f32.raw", f32(audio_a2a), meta, dtype="f32")
 
     meta_path = os.path.join(args.out, "meta.json")
     with open(meta_path, "w") as f:
