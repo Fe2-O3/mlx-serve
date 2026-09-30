@@ -32,11 +32,12 @@ final class MusicGenTests: XCTestCase {
                        "ddalcu/ACE-Step-1.5-XL-Turbo-MLX-Serve-8bit")
     }
 
-    /// Stable Audio 3 is the third engine: pure text-to-audio. The server
-    /// names EVERY field the other two condition on a 400, so the preset's
-    /// flags must gate the pane AND the wire — a value lingering in sticky
-    /// settings across a model switch must not reach a server that refuses
-    /// it, and must not be claimed in the sidecar either.
+    /// Stable Audio 3 is the third engine: text-to-audio from prompt text
+    /// (plus its own audio-to-audio, `testStableAudio3InitAudioIsGatedAndLandsOnTheWire`).
+    /// The server names EVERY field the other two condition on a 400, so the
+    /// preset's flags must gate the pane AND the wire — a value lingering in
+    /// sticky settings across a model switch must not reach a server that
+    /// refuses it, and must not be claimed in the sidecar either.
     func testStableAudio3IsTextToAudioAndGatesEveryOtherEngineField() {
         let p = MusicModelPreset.stableAudio3Medium
         XCTAssertEqual(p.family, .stableAudio3)
@@ -171,6 +172,88 @@ final class MusicGenTests: XCTestCase {
         XCTAssertEqual(fromOld.apg, 1.0, "full APG — the reference default")
     }
 
+    /// Stage 3 of the SA3 port: audio-to-audio. `init_audio` (base64 WAV) +
+    /// `init_noise_level` travel ONLY to the one engine that reads them —
+    /// ACE-Step and Music 3 both name them a 400 — and each stands alone:
+    /// there is no pairing rule between them (a σmax below 1.0 with no init
+    /// clip is a legal schedule effect the reference allows).
+    func testStableAudio3InitAudioIsGatedAndLandsOnTheWire() throws {
+        XCTAssertTrue(MusicModelPreset.stableAudio3Medium.supportsInitAudio)
+        for p in MusicModelPreset.all {
+            XCTAssertEqual(p.supportsInitAudio, p.family == .stableAudio3, p.id)
+        }
+
+        // Both set: both ride, exactly as set, and the sidecar claims the
+        // same run the body asked for.
+        var on = MusicGenRequest(model: .stableAudio3Medium, prompt: "piano")
+        on.initAudioPath = "/tmp/init.wav"
+        on.initNoiseLevel = 0.5
+        let body = MusicGenService.requestBody(on, modelName: "sa3", initAudioB64: "UklGRg==")
+        XCTAssertEqual(body["init_audio"] as? String, "UklGRg==")
+        XCTAssertEqual(body["init_noise_level"] as? Double, 0.5)
+        let txt = MusicGenService.settingsText(on, resolvedSeed: 7, modelName: "sa3")
+        XCTAssertTrue(txt.contains("init_noise_level: 0.5"))
+        XCTAssertTrue(txt.contains("init_audio: init.wav"), "records the clip actually used")
+
+        // σmax alone (no clip) still rides: it is a schedule effect, not a
+        // pairing, and the server's default is 1.0 — never sent as 0.0 here.
+        var sched = MusicGenRequest(model: .stableAudio3Medium, prompt: "piano")
+        sched.initNoiseLevel = 0.8
+        let schedBody = MusicGenService.requestBody(sched, modelName: "sa3")
+        XCTAssertNil(schedBody["init_audio"], "no clip, no field")
+        XCTAssertEqual(schedBody["init_noise_level"] as? Double, 0.8)
+
+        // A clip alone rides too (σmax defaults to 1.0 server-side).
+        var clipOnly = MusicGenRequest(model: .stableAudio3Medium, prompt: "piano")
+        clipOnly.initAudioPath = "/tmp/init.wav"
+        let clipBody = MusicGenService.requestBody(clipOnly, modelName: "sa3", initAudioB64: "UklGRg==")
+        XCTAssertEqual(clipBody["init_audio"] as? String, "UklGRg==")
+
+        // Sticky values across a model switch must not reach the engines
+        // that refuse them by name.
+        var ace = MusicGenRequest(model: .acestepXLTurbo8bit, prompt: "piano")
+        ace.initAudioPath = "/tmp/init.wav"
+        ace.initNoiseLevel = 0.5
+        let aceBody = MusicGenService.requestBody(ace, modelName: "ace", initAudioB64: "UklGRg==")
+        XCTAssertNil(aceBody["init_audio"])
+        XCTAssertNil(aceBody["init_noise_level"])
+        XCTAssertFalse(MusicGenService.settingsText(ace, resolvedSeed: 1, modelName: "ace")
+            .contains("init_noise_level"))
+
+        // The server's refusal messages are the contract the gate exists to
+        // satisfy — pin both spellings so a server change surfaces here
+        // rather than in a live 400.
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent()
+        let gen = try String(contentsOf: root.appendingPathComponent("src/gen.zig"), encoding: .utf8)
+        XCTAssertTrue(gen.contains("are Stable Audio 3 fields"),
+                      "src/gen.zig no longer refuses init_audio on ACE-Step / Music 3")
+        XCTAssertTrue(gen.contains("'init_noise_level' must be ≥ 0.01"),
+                      "src/gen.zig no longer enforces the σmax floor")
+    }
+
+    /// The init clip + σmax are sticky like every other music setting, and a
+    /// blob written by a build that predates them still decodes (the
+    /// decodeIfPresent migration rule).
+    func testMusicInitAudioSettingsRoundTripAndDecodeLegacyBlobs() throws {
+        var s = MusicGenSettings()
+        s.initAudioPath = "/tmp/init.wav"
+        s.initNoiseLevel = 0.4
+        let data = try JSONEncoder().encode(s)
+        let back = try JSONDecoder().decode(MusicGenSettings.self, from: data)
+        XCTAssertEqual(back.initAudioPath, "/tmp/init.wav")
+        XCTAssertEqual(back.initNoiseLevel, 0.4)
+
+        var legacy = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        legacy.removeValue(forKey: "initAudioPath")
+        legacy.removeValue(forKey: "initNoiseLevel")
+        let old = try JSONSerialization.data(withJSONObject: legacy)
+        let fromOld = try JSONDecoder().decode(MusicGenSettings.self, from: old)
+        XCTAssertNil(fromOld.initAudioPath)
+        XCTAssertEqual(fromOld.initNoiseLevel, 1.0, "σmax 1.0 = pure text-to-audio, the reference default")
+    }
+
     func testReferenceAudioIsDeclaredPerFamilyAndSentOnlyThere() {
         // ACE-Step has a timbre slot; Music 3 names `ref_audio` a 400. The
         // preset flag gates the control AND the field, so a clip left behind
@@ -260,8 +343,25 @@ final class MusicGenTests: XCTestCase {
         XCTAssertTrue(src.contains("service.generate(req, server: server, downloads: downloads)"))
     }
 
-    // MARK: - Request wire contract
+    /// The unreachable-settings class again: the audio-to-audio well and its
+    /// σmax slider must be RENDERED (a gated control that is never drawn is
+    /// a control that does nothing), so a source scan pins them.
+    func testInitAudioControlsExistInThePane() throws {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Sources/MLXServe/Views/MusicGenView.swift")
+        let src = try String(contentsOf: url, encoding: .utf8)
+        for needle in ["model.supportsInitAudio { initAudioSection }",
+                       "value: $initNoiseLevel",
+                       "acceptInitAudio(", "clearInitAudio()",
+                       "chooseInitAudioFile()"] {
+            XCTAssertTrue(src.contains(needle), "MusicGenView has no control for \(needle)")
+        }
+        // The service is what reads the clip — the pane alone never sends it.
+        XCTAssertTrue(src.contains("initAudioPath: initAudioURL?.path"))
+    }
 
+    // MARK: - Request wire contract
     func testRequestBodyOmitsEmptyOptionalFields() {
         let req = MusicGenRequest(
             model: .acestepXLTurbo8bit,

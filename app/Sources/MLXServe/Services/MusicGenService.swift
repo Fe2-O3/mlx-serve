@@ -33,7 +33,7 @@ final class MusicGenService: ObservableObject {
 
     /// The `/v1/audio/music-generations` request body. Static + pure so unit
     /// tests pin the wire contract (omit-empty fields, seed resolution).
-    nonisolated static func requestBody(_ request: MusicGenRequest, modelName: String, refAudioB64: String? = nil, srcAudioB64: String? = nil) -> [String: Any] {
+    nonisolated static func requestBody(_ request: MusicGenRequest, modelName: String, refAudioB64: String? = nil, srcAudioB64: String? = nil, initAudioB64: String? = nil) -> [String: Any] {
         // Sticky settings outlive a model switch: clamp the duration into THIS
         // model's server-valid range rather than earn a 400.
         let range = request.model.durationRange
@@ -121,6 +121,20 @@ final class MusicGenService: ObservableObject {
                 if !neg.isEmpty { body["negative_prompt"] = neg }
             }
         }
+        // Stage-3 audio-to-audio is Stable Audio 3's alone — ACE-Step and
+        // Music 3 name BOTH fields a 400 — so the fields are gated here like
+        // `steps`, not just at the pane's well (values linger in @State
+        // across a model switch). The two stand alone: σmax with no clip is a
+        // legal schedule effect (the server validates its floor either way),
+        // and a clip with the default σmax is the full-strength mix. σmax is
+        // always sent where it is read, so an explicit 1.0 reads as "off"
+        // rather than as an omitted default the log cannot show.
+        if request.model.supportsInitAudio {
+            body["init_noise_level"] = request.initNoiseLevel
+            if let initAudioB64, !initAudioB64.isEmpty {
+                body["init_audio"] = initAudioB64
+            }
+        }
         // -1 = fresh random seed, resolved HERE so the log can show it.
         body["seed"] = request.seed >= 0 ? request.seed : Int.random(in: 0..<1_000_000_000)
         return body
@@ -183,6 +197,14 @@ final class MusicGenService: ObservableObject {
                 if !neg.isEmpty { lines.append("negative_prompt: \(neg)") }
             }
         }
+        // Audio-to-audio mirrors the body's gate exactly: on a model that
+        // never receives the fields, no record of them either.
+        if request.model.supportsInitAudio {
+            lines.append("init_noise_level: \(request.initNoiseLevel)")
+            if let path = request.initAudioPath, !path.isEmpty {
+                lines.append("init_audio: \((path as NSString).lastPathComponent)")
+            }
+        }
         var out = lines.joined(separator: "\n")
         out += "\n\n# Style prompt\n" + request.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         // Gated like the body: a model that never receives lyrics gets no
@@ -210,6 +232,15 @@ final class MusicGenService: ObservableObject {
         return (try? Data(contentsOf: URL(fileURLWithPath: path)))?.base64EncodedString()
     }
 
+    /// The audio-to-audio seed clip as base64 for `init_audio`; nil unless
+    /// the model reads it and a clip is attached. The SERVER resamples to
+    /// 44.1 kHz, so the file goes over as-is — no transcode needed here.
+    nonisolated static func initAudioB64(_ request: MusicGenRequest) -> String? {
+        guard request.model.supportsInitAudio,
+              let path = request.initAudioPath, !path.isEmpty else { return nil }
+        return (try? Data(contentsOf: URL(fileURLWithPath: path)))?.base64EncodedString()
+    }
+
     /// Cover mode reads the FSQ tokenizer, shipped as `fsq.safetensors` beside
     /// `model.safetensors`. Packs downloaded before it exist without the file.
     /// `CoverWeightsFetch` owns the name — one spelling, or the app fetches a
@@ -234,6 +265,14 @@ final class MusicGenService: ObservableObject {
         }
         if request.model.supportsSourceAudio, request.task.needsSource, request.srcAudioPath == nil {
             phase = .failed("\(request.task.label) needs a source audio file.")
+            return
+        }
+        // A picked init clip that no longer exists must fail loud: sending
+        // without it would generate from the prompt alone and hand back audio
+        // that ignored what was asked for.
+        if request.model.supportsInitAudio, let p = request.initAudioPath, !p.isEmpty,
+           !FileManager.default.fileExists(atPath: p) {
+            phase = .failed("The seed audio file is missing — pick it again.")
             return
         }
         // TEMPORARY migration (2026-08-22): a pack downloaded before cover mode
@@ -267,6 +306,7 @@ final class MusicGenService: ObservableObject {
         let keep = request.keepResident
         let refB64 = Self.referenceB64(request)
         let srcB64 = Self.sourceB64(request)
+        let initB64 = Self.initAudioB64(request)
 
         task = Task {
             var loadedId: String? = nil
@@ -281,7 +321,7 @@ final class MusicGenService: ObservableObject {
                 // SSE stages: encode (conditioning) → diffuse (8 turbo steps)
                 // → decode (VAE chunks); the `complete` event carries the WAV.
                 var wav: Data? = nil
-                let reqJson = Self.requestBody(request, modelName: modelId, refAudioB64: refB64, srcAudioB64: srcB64)
+                let reqJson = Self.requestBody(request, modelName: modelId, refAudioB64: refB64, srcAudioB64: srcB64, initAudioB64: initB64)
                 let resolvedSeed = reqJson["seed"] as? Int ?? request.seed
                 for try await ev in api.streamGeneration(
                     port: port, path: "/v1/audio/music-generations",
@@ -350,10 +390,17 @@ final class MusicGenService: ObservableObject {
         guard request.lanModelId != nil || ServerManager.resolveModelDir(repo: request.model.repo) != nil else {
             throw MediaGenError.notDownloaded(request.model.name)
         }
+        // Same fail-loud as `generate`: a vanished seed clip must not silently
+        // degrade to text-to-audio.
+        if request.model.supportsInitAudio, let p = request.initAudioPath, !p.isEmpty,
+           !FileManager.default.fileExists(atPath: p) {
+            throw MediaGenError.emptyInput("Seed audio file (missing — pick it again)")
+        }
 
         let outputPath = Self.makeOutputPath(prompt: request.prompt)
         let keep = request.keepResident
         let refB64 = Self.referenceB64(request)
+        let initB64 = Self.initAudioB64(request)
         let startedAt = Date()
         func report(_ step: Int, _ total: Int, _ message: String) {
             onProgress?(MediaGenProgress(kind: .music, step: step, total: total,
@@ -368,7 +415,7 @@ final class MusicGenService: ObservableObject {
         }
         do {
             var wav: Data? = nil
-            let reqJson = Self.requestBody(request, modelName: modelId, refAudioB64: refB64)
+            let reqJson = Self.requestBody(request, modelName: modelId, refAudioB64: refB64, initAudioB64: initB64)
             let resolvedSeed = reqJson["seed"] as? Int ?? request.seed
             for try await ev in api.streamGeneration(
                 port: port, path: "/v1/audio/music-generations", json: reqJson) {

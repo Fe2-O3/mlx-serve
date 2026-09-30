@@ -1479,6 +1479,13 @@ struct MusicModelPreset: Identifiable, Hashable {
     /// would be a named 400 — so the knobs AND the fields are gated together
     /// (sticky values survive a model switch, like the tempo/key gate above).
     var supportsGuidance: Bool { family == .stableAudio3 }
+    /// Audio-to-audio (server `init_audio` / `init_noise_level`): Stable
+    /// Audio 3's SAME-L encoder turns a seed clip into latents that are mixed
+    /// with the noise at `init_noise_level`. ACE-Step covers through
+    /// `src_audio`+`task` and Music 3 has neither — both name these fields a
+    /// 400, so the well AND the fields are gated together (sticky values
+    /// survive a model switch, like the guidance gate above).
+    var supportsInitAudio: Bool { family == .stableAudio3 }
 
     /// ACE-Step v1.5 XL Turbo, 8-bit — 4B-class DiT, 8-step distilled.
     /// Published converted repo (DiT+encoders, Oobleck VAE, Qwen3-Embedding
@@ -1509,10 +1516,11 @@ struct MusicModelPreset: Identifiable, Hashable {
     )
 
     /// Stable Audio 3 Medium, 8-bit — differential-attention DiT (1536w, 24
-    /// blocks) + T5Gemma text encoder + SAME-L decoder at 44.1 kHz. Pure
-    /// text-to-audio: no lyrics path, no tempo/key fields — every knob is
-    /// prompt text. No published mlx-serve repo yet, so weights are converted
-    /// on-device with `tests/convert_stable_audio3_weights.py`.
+    /// blocks) + T5Gemma text encoder + SAME-L codec at 44.1 kHz. Text-to-
+    /// audio from prompt text only (no lyrics path, no tempo/key fields) —
+    /// plus audio-to-audio through a seed clip (`init_audio`). No published
+    /// mlx-serve repo yet, so weights are converted on-device with
+    /// `tests/convert_stable_audio3_weights.py`.
     static let stableAudio3Medium = MusicModelPreset(
         id: "stable-audio-3-medium-8bit",
         name: "Stable Audio 3 Medium (8-bit)",
@@ -1522,7 +1530,7 @@ struct MusicModelPreset: Identifiable, Hashable {
         approxDownloadGB: 5.5,
         fixedSteps: 8,
         supportsLyrics: false,
-        description: "Stability's text-to-audio model: describes sounds, ambience and instrumental music in words and renders them at 44.1 kHz in 8 ping-pong steps. No lyrics or tempo fields — put everything in the style prompt."
+        description: "Stability's text-to-audio model: describes sounds, ambience and instrumental music in words and renders them at 44.1 kHz in 8 ping-pong steps. Feed it a clip to reshape (audio-to-audio). No lyrics or tempo fields — put everything in the style prompt."
     )
 
     /// Catalog, best-first per family.
@@ -2299,6 +2307,16 @@ struct MusicGenRequest {
     /// orthogonal to the conditional prediction — 1 = full APG (reference
     /// default), 0 = vanilla CFG. Only sent alongside an active cfg_scale.
     var apg: Double = 1.0
+    /// Audio-to-audio seed clip (server `init_audio`, SA3 only): a WAV the
+    /// SAME-L encoder turns into latents mixed with the noise. No pairing
+    /// with `initNoiseLevel` — each stands alone (σmax below 1.0 with no
+    /// clip is a legal schedule effect). Only sent where `supportsInitAudio`.
+    var initAudioPath: String? = nil
+    /// σmax (server `init_noise_level`, SA3 only), floor 0.01: how much of
+    /// the output is the prompt vs. the seed clip — 1.0 (default) is pure
+    /// text-to-audio, lower keeps more of the clip. Sent where
+    /// `supportsInitAudio` even with no clip (a schedule effect on its own).
+    var initNoiseLevel: Double = 1.0
     /// Complete: instruments to add, from `MusicTask.trackClasses`; empty =
     /// the model decides.
     var trackClasses: [String] = []

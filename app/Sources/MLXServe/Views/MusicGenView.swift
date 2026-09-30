@@ -70,6 +70,15 @@ struct MusicGenView: View {
     @State private var cfgScale: Double = 1.0
     @State private var negativePrompt: String = ""
     @State private var apg: Double = 1.0
+    // Stage-3 audio-to-audio (Stable Audio 3 only): the seed clip and σmax.
+    // Sticky like everything above — the SERVICE gates both fields on
+    // `supportsInitAudio`, so a value left behind by a model switch never
+    // reaches a server that names it a 400.
+    @State private var initAudioURL: URL? = nil
+    @State private var initAudioError: String? = nil
+    @State private var isInitAudioDropTargeted: Bool = false
+    @State private var initAudioBusy: Bool = false
+    @State private var initNoiseLevel: Double = 1.0
     /// Keep the model resident after generating (default off → unload).
     @State private var keepResident: Bool = false
     /// Hydration guard — see ImageGenView for the full rationale.
@@ -154,6 +163,7 @@ struct MusicGenView: View {
                     // fields a 400, so the whole block stays hidden there.
                     if model.supportsLyrics { lyricsSection }
                     if model.supportsReferenceAudio { referenceSection }
+                    if model.supportsInitAudio { initAudioSection }
                     // No Duration in a source task: the clip is the length, and
                     // the Source well already says how long that is.
                     if !sourceTask { durationSection }
@@ -586,6 +596,101 @@ struct MusicGenView: View {
         refAudioURL = nil
     }
 
+    /// Audio-to-audio (Stable Audio 3 only): a seed clip the SAME-L encoder
+    /// turns into latents, mixed with the noise at the strength below. Same
+    /// pick / drop / preview / clear shape as the reference well above; the
+    /// length is taken from Duration (the server pads or trims the clip to
+    /// the track's grid), so the well never has to say "as long as this clip".
+    private var initAudioSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Seed audio (optional)").font(.app(.subheadline).weight(.semibold))
+                Spacer()
+            }
+            if let url = initAudioURL {
+                MediaDropWellFilled(isTargeted: isInitAudioDropTargeted) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "waveform.circle.fill").foregroundStyle(.blue)
+                        Text(url.lastPathComponent)
+                            .font(.app(.caption)).lineLimit(1).truncationMode(.middle)
+                        Spacer()
+                        if clipPlayer.playingPath == url.path {
+                            Button { clipPlayer.stop() } label: { Image(systemName: "stop.circle.fill") }
+                                .buttonStyle(.borderless).help("Stop preview")
+                        } else {
+                            Button { clipPlayer.play(url.path) } label: { Image(systemName: "play.circle") }
+                                .buttonStyle(.borderless).help("Preview seed audio")
+                        }
+                        Button { clearInitAudio() } label: { Image(systemName: "xmark.circle.fill") }
+                            .buttonStyle(.borderless).foregroundStyle(.secondary).help("Clear seed audio")
+                    }
+                }
+            } else if initAudioBusy {
+                MediaDropWellFilled(isTargeted: isInitAudioDropTargeted) { converting }
+            } else {
+                MediaDropWell(title: "Choose file…",
+                              systemImage: "waveform.badge.plus",
+                              caption: "Start from an existing sound instead of pure noise. The model reshapes it toward the prompt.",
+                              isTargeted: isInitAudioDropTargeted,
+                              action: chooseInitAudioFile)
+            }
+            if let err = initAudioError {
+                Text(err).font(.app(.caption2)).foregroundStyle(.orange)
+            }
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text("Seed noise").font(.app(.caption))
+                    Spacer()
+                    Text(String(format: "%.2f", initNoiseLevel))
+                        .font(.app(.caption).monospacedDigit()).foregroundStyle(.secondary)
+                }
+                Slider(value: $initNoiseLevel, in: 0.01...1, step: 0.01)
+                Text(initAudioURL == nil
+                     ? "1.00 (default) starts from pure noise — no clip attached, this does nothing."
+                     : "1.00 rebuilds from pure noise; lower keeps more of your clip.")
+                    .font(.app(.caption2)).foregroundStyle(.secondary)
+            }
+            .padding(.top, 4)
+        }
+        .mediaDrop(.audio, isTargeted: $isInitAudioDropTargeted) { urls in
+            if let url = urls.first { acceptInitAudio(url) }
+        }
+    }
+
+    private func chooseInitAudioFile() {
+        initAudioError = nil
+        let panel = OpenPanel.make()
+        panel.allowedContentTypes = [.audio, .wav, .mp3, .mpeg4Audio, .aiff]
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        guard AppActivation.runModal(panel) == .OK, let url = panel.url else { return }
+        acceptInitAudio(url)
+    }
+
+    /// Picked or dropped, a file becomes the seed clip the same way as the
+    /// reference: a stereo WAV transcode, or a visible reason instead of a
+    /// clip that silently doesn't attach. Capped at the chosen duration — the
+    /// server pads or trims to the track's grid anyway, so a longer file only
+    /// costs upload time.
+    private func acceptInitAudio(_ url: URL) {
+        guard !initAudioBusy else { return }
+        initAudioError = nil
+        initAudioBusy = true
+        transcode(url, maxSeconds: max(Double(durationSeconds), 1)) { result in
+            initAudioBusy = false
+            switch result {
+            case .success(let wav): initAudioURL = wav
+            case .failure(let err): initAudioError = err.localizedDescription
+            }
+        }
+    }
+
+    private func clearInitAudio() {
+        if let url = initAudioURL { try? FileManager.default.removeItem(at: url) }
+        initAudioURL = nil
+    }
+
     /// Best-per-capability up front, everything else behind "Other Models", and
     /// the Download button ON the model — see `MediaModelChooser`. The transfer
     /// bar and residency both belong to the model, not to the track, so they
@@ -998,6 +1103,10 @@ struct MusicGenView: View {
         cfgScale = s.cfgScale
         negativePrompt = s.negativePrompt
         apg = s.apg
+        initAudioURL = s.initAudioPath.flatMap { FileManager.default.fileExists(atPath: $0) ? URL(fileURLWithPath: $0) : nil }
+        // Clamp into the server's legal range: a blob edited by hand (or a
+        // future slider range) must not reach a 400 on the σmax floor.
+        initNoiseLevel = min(max(s.initNoiseLevel, 0.01), 1.0)
     }
 
     /// Every sticky field, as the blob it would persist to — `Equatable`, so
@@ -1027,6 +1136,8 @@ struct MusicGenView: View {
         s.cfgScale = cfgScale
         s.negativePrompt = negativePrompt
         s.apg = apg
+        s.initAudioPath = initAudioURL?.path
+        s.initNoiseLevel = initNoiseLevel
         return s
     }
 
@@ -1159,6 +1270,8 @@ struct MusicGenView: View {
             cfgScale: cfgScale,
             negativePrompt: negativePrompt,
             apg: apg,
+            initAudioPath: initAudioURL?.path,
+            initNoiseLevel: initNoiseLevel,
             trackClasses: trackClasses,
             lanModelId: lanModel
         )

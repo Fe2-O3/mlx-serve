@@ -268,6 +268,13 @@ struct MusicGenSettings: Codable, Equatable {
     var cfgScale: Double = 1.0
     var negativePrompt: String = ""
     var apg: Double = 1.0
+    /// Stage-3 audio-to-audio (Stable Audio 3 only on the wire): the seed
+    /// clip and σmax. Sticky like the guidance trio — `requestBody`'s
+    /// `supportsInitAudio` gate drops both on any other family. `initAudioPath`
+    /// is only meaningful if that file still exists when the pane hydrates.
+    var initAudioPath: String? = nil
+    /// σmax floor is 0.01 server-side; 1.0 (default) = pure text-to-audio.
+    var initNoiseLevel: Double = 1.0
 
     private static let storageKey = "musicGenSettings"
 
@@ -327,6 +334,8 @@ extension MusicGenSettings {
         if let v = try c.decodeIfPresent(Double.self, forKey: .cfgScale) { cfgScale = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .negativePrompt) { negativePrompt = v }
         if let v = try c.decodeIfPresent(Double.self, forKey: .apg) { apg = v }
+        initAudioPath = try c.decodeIfPresent(String.self, forKey: .initAudioPath)
+        if let v = try c.decodeIfPresent(Double.self, forKey: .initNoiseLevel) { initNoiseLevel = v }
     }
 }
 
