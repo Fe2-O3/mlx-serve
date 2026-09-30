@@ -3,10 +3,11 @@
 # the pack by absolute path -> /v1/models shows "audio"+"music" capabilities ->
 # POST /v1/audio/music-generations -> assert a valid 44.1 kHz stereo PCM16 WAV
 # -> the 400 family (missing prompt, bad duration/steps, ACE-Step / MiniMax
-# fields refused BY NAME, guidance type/range/pairing refusals, TTS endpoint
-# mismatch) -> a guidance generation (cfg_scale + negative_prompt + apg)
-# -> SSE streaming with condition/sample progress + base64 complete -> chat
-# coexistence -> unload.
+# fields refused BY NAME, guidance type/range/pairing refusals, audio-to-audio
+# σmax floor + payload refusals, TTS endpoint mismatch) -> a guidance
+# generation (cfg_scale + negative_prompt + apg) -> an audio-to-audio
+# generation (init_audio + init_noise_level) -> SSE streaming with
+# condition/sample progress + base64 complete -> chat coexistence -> unload.
 # Proves the third music backend routes end to end.
 #
 # Skips gracefully when no converted pack is present. Convert with:
@@ -86,10 +87,16 @@ b400 "duration 999" "{\"model\":\"$SA3_ID\",\"prompt\":\"jazz\",\"duration_secon
 b400 "steps 0" "{\"model\":\"$SA3_ID\",\"prompt\":\"jazz\",\"steps\":0}"
 b400 "steps 101" "{\"model\":\"$SA3_ID\",\"prompt\":\"jazz\",\"steps\":101}"
 # Fields the OTHER music engines condition on: SA3 has no conditioning path
-# for them, so each is refused BY NAME pointing at 'prompt', never ignored.
-for f in '"lyrics":"[verse]\nla la"' '"instrumental":true' '"bpm":120' '"keyscale":"C major"' '"ref_audio":"AAAA"' '"src_audio":"AAAA"' '"task":"cover"' '"timesignature":"4/4"' '"vocal_language":"en"'; do
+# for them, so each is refused BY NAME, never ignored. src_audio/task get
+# pointed at SA3's own audio-to-audio instead of 'prompt'.
+for f in '"src_audio":"AAAA"' '"task":"cover"'; do
   b400 "unsupported field ${f%%:*}" "{\"model\":\"$SA3_ID\",\"prompt\":\"jazz\",$f}"
-  grep -q 'Stable Audio 3 is text-to-audio' /tmp/test_stable_audio3_err.txt \
+  grep -q "init_audio" /tmp/test_stable_audio3_err.txt \
+    || { echo "FAIL: src_audio/task 400 does not point at init_audio"; cat /tmp/test_stable_audio3_err.txt; exit 1; }
+done
+for f in '"lyrics":"[verse]\nla la"' '"instrumental":true' '"bpm":120' '"keyscale":"C major"' '"ref_audio":"AAAA"' '"timesignature":"4/4"' '"vocal_language":"en"'; do
+  b400 "unsupported field ${f%%:*}" "{\"model\":\"$SA3_ID\",\"prompt\":\"jazz\",$f}"
+  grep -q 'Stable Audio 3 has no conditioning path' /tmp/test_stable_audio3_err.txt \
     || { echo "FAIL: unsupported-field 400 does not NAME the SA3 contract"; cat /tmp/test_stable_audio3_err.txt; exit 1; }
 done
 # Stage-2 guidance: type/range/pairing mistakes are 400s that NAME the field,
@@ -102,6 +109,17 @@ b400 "apg negative" "{\"model\":\"$SA3_ID\",\"prompt\":\"jazz\",\"cfg_scale\":3,
 b400 "negative_prompt without guidance" "{\"model\":\"$SA3_ID\",\"prompt\":\"jazz\",\"negative_prompt\":\"no drums\"}"
 grep -q "cfg_scale" /tmp/test_stable_audio3_err.txt || { echo "FAIL: negative-without-cfg 400 does not point at cfg_scale"; cat /tmp/test_stable_audio3_err.txt; exit 1; }
 b400 "negative_prompt non-string" "{\"model\":\"$SA3_ID\",\"prompt\":\"jazz\",\"cfg_scale\":3,\"negative_prompt\":42}"
+# Stage-3 audio-to-audio: σmax floor, type errors and bad payloads are 400s
+# that NAME the field — never a silent default, never a half-decoded WAV.
+b400 "init_noise_level below floor" "{\"model\":\"$SA3_ID\",\"prompt\":\"jazz\",\"init_noise_level\":0.005}"
+grep -q "init_noise_level" /tmp/test_stable_audio3_err.txt || { echo "FAIL: low σmax 400 does not name init_noise_level"; cat /tmp/test_stable_audio3_err.txt; exit 1; }
+b400 "init_noise_level non-numeric" "{\"model\":\"$SA3_ID\",\"prompt\":\"jazz\",\"init_noise_level\":\"lots\"}"
+b400 "init_noise_level NaN" "{\"model\":\"$SA3_ID\",\"prompt\":\"jazz\",\"init_noise_level\":\"nan\"}"
+b400 "init_audio non-string" "{\"model\":\"$SA3_ID\",\"prompt\":\"jazz\",\"init_audio\":42}"
+grep -q "init_audio" /tmp/test_stable_audio3_err.txt || { echo "FAIL: init_audio type 400 does not name init_audio"; cat /tmp/test_stable_audio3_err.txt; exit 1; }
+b400 "init_audio bad base64" "{\"model\":\"$SA3_ID\",\"prompt\":\"jazz\",\"init_audio\":\"not base64!!\"}"
+grep -q "init_audio" /tmp/test_stable_audio3_err.txt || { echo "FAIL: bad-base64 400 does not name init_audio"; cat /tmp/test_stable_audio3_err.txt; exit 1; }
+b400 "init_audio not a WAV" "{\"model\":\"$SA3_ID\",\"prompt\":\"jazz\",\"init_audio\":\"$(printf 'not a wave file padded out' | base64)\"}"
 # The TTS endpoint against a music model is an explicit 400.
 code=$(api /v1/audio/speech -X POST -H 'Content-Type: application/json' \
   -d "{\"model\":\"$SA3_ID\",\"input\":\"hello\"}" -o /dev/null -w "%{http_code}")
@@ -131,6 +149,38 @@ code=$(api /v1/audio/music-generations -X POST -H 'Content-Type: application/jso
 wav_ok /tmp/test_stable_audio3_guidance.wav "guidance gen" 0.5 4.5
 grep -q '\[sa3\] generating .*cfg=3' /tmp/test_stable_audio3_server.log || { echo "FAIL: guidance generation did not log cfg=3"; exit 1; }
 echo "PASS: guidance generation (cfg=3 + negative + apg) -> WAV, cfg logged"
+
+# 3c. Audio-to-audio: feed a real WAV as init_audio with σmax 0.5 -> valid WAV,
+# and the log must show init audio was taken (not silently dropped).
+python3 - <<'PY'
+import struct, math, base64
+rate, secs = 44100, 2.0
+n = int(rate * secs)
+frames = b"".join(
+    struct.pack("<hh", int(0.4 * 32767 * math.sin(2 * math.pi * 220 * i / rate)),
+                int(0.4 * 32767 * math.sin(2 * math.pi * 330 * i / rate)))
+    for i in range(n)
+)
+hdr = b"RIFF" + struct.pack("<I", 36 + len(frames)) + b"WAVEfmt " + struct.pack("<IHHIIHH", 16, 1, 2, rate, rate * 4, 4, 16) + b"data" + struct.pack("<I", len(frames))
+open("/tmp/test_stable_audio3_init.b64", "w").write(base64.b64encode(hdr + frames).decode())
+PY
+python3 - "$SA3_ID" <<'PY' > /tmp/test_stable_audio3_a2a_req.json
+import json, sys
+print(json.dumps({
+    "model": sys.argv[1],
+    "prompt": "a gentle piano arpeggio",
+    "duration_seconds": 4, "steps": 8, "seed": 7,
+    "init_audio": open("/tmp/test_stable_audio3_init.b64").read(),
+    "init_noise_level": 0.5,
+}))
+PY
+code=$(api /v1/audio/music-generations -X POST -H 'Content-Type: application/json' \
+  -d @/tmp/test_stable_audio3_a2a_req.json -o /tmp/test_stable_audio3_a2a.wav -w "%{http_code}")
+[ "$code" = "200" ] || { echo "FAIL: a2a music gen http $code"; head -c 300 /tmp/test_stable_audio3_a2a.wav; tail -20 /tmp/test_stable_audio3_server.log; exit 1; }
+wav_ok /tmp/test_stable_audio3_a2a.wav "audio-to-audio gen" 0.5 4.5
+grep -q '\[sa3\] init audio' /tmp/test_stable_audio3_server.log || { echo "FAIL: no [sa3] init audio in log"; exit 1; }
+grep -q '\[sa3\] generating .*smax=0.5' /tmp/test_stable_audio3_server.log || { echo "FAIL: a2a generation did not log smax=0.5"; exit 1; }
+echo "PASS: audio-to-audio gen (init_audio + σmax 0.5) -> WAV, init + smax logged"
 
 # 4. Server survives the gen.
 curl -sf "http://127.0.0.1:$PORT/health" >/dev/null || { echo "FAIL: server died after music gen"; exit 1; }

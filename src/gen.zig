@@ -2670,6 +2670,8 @@ pub fn handleMusic(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
 }
 
 fn handleMusicAcestep(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, music: *acestep.Engine) !void {
+    // audio-to-audio is Stable Audio 3 only — never silently dropped here
+    if (a2aFieldRefusal(body)) |m| return sendError(conn, 400, m);
     const raw_prompt = extractJsonString(body, "prompt") orelse return sendError(conn, 400, "missing 'prompt' (style/genre/mood description)");
     const prompt = try jsonUnescape(allocator, raw_prompt);
     defer allocator.free(prompt);
@@ -2866,6 +2868,8 @@ fn handleMusic3(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, m3:
     // key and scale, and its example caption reads
     // "Genre: acoustic pop. BPM: 96. Key: C major.", so they are supported;
     // they are just caption TEXT here rather than conditioning fields.
+    // audio-to-audio is Stable Audio 3 only — never silently dropped here.
+    if (a2aFieldRefusal(body)) |m| return sendError(conn, 400, m);
     for ([_][]const u8{ "timesignature", "vocal_language" }) |field| {
         const present = extractJsonString(body, field) != null or extractJsonInt(body, field) != null;
         if (present) {
@@ -2980,19 +2984,24 @@ fn handleMusic3(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, m3:
     return sendBytes(conn, allocator, "audio/wav", wav);
 }
 
-/// POST /v1/audio/music-generations on the Stable Audio 3 backend — pure
-/// text-to-audio: `{prompt, duration_seconds, steps, seed, stream}`. Every
+/// POST /v1/audio/music-generations on the Stable Audio 3 backend —
+/// text-to-audio `{prompt, duration_seconds, steps, seed, stream}`, plus
+/// audio-to-audio via `init_audio` + `init_noise_level` (stage 3). Every
 /// knob the other music engines condition on (lyrics/instrumental, bpm/
-/// keyscale, reference/cover audio, task) is a named 400 pointing at
-/// 'prompt' — SA3 has no conditioning path for them, and a silent drop
-/// would let the request "succeed" while ignoring what was asked. Response
-/// mirrors the family: raw `audio/wav` non-stream; SSE `progress` per
-/// stage/step + base64 `complete` when streaming.
+/// keyscale, reference/cover audio, task) is a named 400 — SA3 has no
+/// conditioning path for them, and a silent drop would let the request
+/// "succeed" while ignoring what was asked. `src_audio`/`task` (the
+/// ACE/MiniMax cover path) point at SA3's own `init_audio` instead of
+/// 'prompt', since that IS SA3's audio-to-audio. Response mirrors the
+/// family: raw `audio/wav` non-stream; SSE `progress` per stage/step +
+/// base64 `complete` when streaming.
 fn handleMusicSa3(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, sa: *stable_audio3.Engine) !void {
     for ([_][]const u8{ "lyrics", "instrumental", "bpm", "keyscale", "ref_audio", "src_audio", "task", "timesignature", "vocal_language" }) |field| {
         if (jsonHasKey(body, field)) {
+            if (std.mem.eql(u8, field, "src_audio") or std.mem.eql(u8, field, "task"))
+                return sendError(conn, 400, "'src_audio' / 'task' are ACE-Step cover/complete fields — Stable Audio 3's audio-to-audio is 'init_audio' (base64 WAV) + 'init_noise_level'");
             var msg: [192]u8 = undefined;
-            const m = std.fmt.bufPrint(&msg, "'{s}' is an ACE-Step / MiniMax Music 3 field; Stable Audio 3 is text-to-audio — describe it in 'prompt'", .{field}) catch "unsupported field";
+            const m = std.fmt.bufPrint(&msg, "'{s}' is an ACE-Step / MiniMax Music 3 field; Stable Audio 3 has no conditioning path for it — describe it in 'prompt'", .{field}) catch "unsupported field";
             return sendError(conn, 400, m);
         }
     }
@@ -3010,6 +3019,45 @@ fn handleMusicSa3(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, s
     };
     if (g.neg_raw) |raw| negative = try jsonUnescape(allocator, raw);
 
+    // stage 3: audio-to-audio — init_audio (base64 WAV) + σmax (see
+    // sa3A2aFromJson). No pairing rule: each field stands alone (σmax < 1
+    // without init audio is a legal schedule effect, the reference allows it).
+    const a2a = sa3A2aFromJson(body);
+    if (a2a.err) |m| return sendError(conn, 400, m);
+    var init_audio: ?mlx.mlx_array = null;
+    defer if (init_audio) |r| {
+        _ = mlx.mlx_array_free(r);
+    };
+    if (a2a.init_audio_raw) |raw| {
+        const b64 = try jsonUnescape(allocator, raw);
+        defer allocator.free(b64);
+        const wav_bytes = base64DecodeAlloc(allocator, b64) catch return sendError(conn, 400, "init_audio: invalid base64");
+        defer allocator.free(wav_bytes);
+        const dec = wav_mod.decode(allocator, wav_bytes) catch return sendError(conn, 400, "init_audio: expected a PCM16/PCM24/float32 WAV");
+        defer allocator.free(dec.pcm);
+        const stereo = try wav_mod.toStereoInterleaved(allocator, dec.pcm, dec.channels);
+        defer allocator.free(stereo);
+        const at44k = try wav_mod.resampleLinear(allocator, stereo, 2, dec.sample_rate, stable_audio3.SAMPLE_RATE);
+        defer allocator.free(at44k);
+        // planar [1,2,S]: the engine encodes channel-first (the reference
+        // read_wav layout), unlike acestep's interleaved [1,n,2] — mlx
+        // copies the buffer here, same as the src_audio path above.
+        const n: usize = at44k.len / 2;
+        const planar = try allocator.alloc(f32, at44k.len);
+        defer allocator.free(planar);
+        for (0..n) |i| {
+            planar[i] = at44k[2 * i];
+            planar[n + i] = at44k[2 * i + 1];
+        }
+        const nsh = [3]c_int{ 1, 2, @intCast(n) };
+        init_audio = mlx.mlx_array_new_data(planar.ptr, &nsh, 3, .float32);
+        log.info("[sa3] init audio: {d:.1}s {d} Hz {d}ch -> audio-to-audio\n", .{
+            @as(f32, @floatFromInt(n)) / @as(f32, @floatFromInt(stable_audio3.SAMPLE_RATE)),
+            dec.sample_rate,
+            dec.channels,
+        });
+    }
+
     const duration: u32 = @intCast(extractJsonInt(body, "duration_seconds") orelse 30);
     if (duration < stable_audio3.MIN_DURATION_S or duration > stable_audio3.MAX_DURATION_S)
         return sendError(conn, 400, "'duration_seconds' must be in [1,384]");
@@ -3018,7 +3066,7 @@ fn handleMusicSa3(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, s
     const seed: u64 = extractJsonInt(body, "seed") orelse 42;
 
     const want_stream = sse.bodyWantsTrue(body, "stream");
-    log.info("[sa3] generating {d}s steps={d} seed={d} cfg={d} stream={}\n", .{ duration, steps, seed, g.cfg_scale, want_stream });
+    log.info("[sa3] generating {d}s steps={d} seed={d} cfg={d} smax={d:.2} init_audio={} stream={}\n", .{ duration, steps, seed, g.cfg_scale, a2a.init_noise_level, init_audio != null, want_stream });
     var sctx = sse.StreamCtx{ .conn = conn, .stream = want_stream };
     const prog: ?sse.Progress = sctx.progress();
     if (want_stream) try conn.writeAll(sse.headers);
@@ -3031,6 +3079,8 @@ fn handleMusicSa3(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, s
         .cfg_scale = g.cfg_scale,
         .negative_prompt = negative,
         .apg = g.apg,
+        .init_audio = init_audio,
+        .init_noise_level = a2a.init_noise_level,
     };
     const wav = sa.generateWav(allocator, req, prog) catch |err| {
         if (err == error.Cancelled) {
@@ -3117,6 +3167,62 @@ fn sa3GuidanceFromJson(body: []const u8) Sa3Guidance {
         }
     }
     return g;
+}
+
+/// Parsed Stable Audio 3 audio-to-audio fields (stage 3). `err` non-null →
+/// HTTP 400 message (static); `init_audio_raw` is the raw JSON string slice
+/// borrowed from `body` ("" already normalized to null) — the caller
+/// base64/WAV-decodes it.
+const Sa3A2a = struct {
+    init_noise_level: f32 = 1.0,
+    init_audio_raw: ?[]const u8 = null,
+    err: ?[]const u8 = null,
+};
+
+/// Audio-to-audio fields of an SA3 music body (reference sa3_mlx.py
+/// `--init-audio` / `--init-noise-level`): σmax defaults to 1.0 (the
+/// reference) with a floor of MIN_SIGMA 0.01 — below it the rf_denoiser is
+/// undefined at t≈0 — and no upper bound (the reference has none: >1.0 is a
+/// legal, if extreme, creative setting). Type mismatches fail loud rather
+/// than falling back to defaults, same contract as the guidance fields.
+fn sa3A2aFromJson(body: []const u8) Sa3A2a {
+    var g: Sa3A2a = .{};
+    if (jsonHasKey(body, "init_noise_level")) {
+        const v = extractJsonFloat(body, "init_noise_level") orelse {
+            g.err = "'init_noise_level' must be a number (σmax start, ≥ 0.01)";
+            return g;
+        };
+        const f: f32 = @floatCast(v);
+        if (!std.math.isFinite(f)) {
+            g.err = "'init_noise_level' must be a finite number";
+            return g;
+        }
+        if (f < stable_audio3.MIN_SIGMA) {
+            g.err = "'init_noise_level' must be ≥ 0.01 (σmax floor — the model is undefined at t≈0)";
+            return g;
+        }
+        g.init_noise_level = f;
+    }
+    if (jsonHasKey(body, "init_audio")) {
+        const raw = extractJsonString(body, "init_audio") orelse {
+            g.err = "'init_audio' must be a base64 WAV string";
+            return g;
+        };
+        if (raw.len > 0) g.init_audio_raw = raw;
+    }
+    return g;
+}
+
+/// Refusal message when a body carries a field that exists ONLY on the
+/// Stable Audio 3 path, from the ACE-Step / MiniMax Music 3 handlers:
+/// those engines cover with `src_audio` + `task`, and silently dropping
+/// init_audio would hand back audio that ignored what was asked for.
+const a2a_only_field_msg = "'init_audio' / 'init_noise_level' are Stable Audio 3 fields — on this engine cover a track with 'src_audio' + 'task' instead";
+
+fn a2aFieldRefusal(body: []const u8) ?[]const u8 {
+    if (jsonHasKey(body, "init_audio")) return a2a_only_field_msg;
+    if (jsonHasKey(body, "init_noise_level")) return a2a_only_field_msg;
+    return null;
 }
 
 /// POST /v1/video/generations — base64 RGB8 frames (or SSE progress + complete).
@@ -6327,6 +6433,55 @@ test "sa3GuidanceFromJson: cfg/apg/negative_prompt parse, range, and pairing rul
     // A non-string negative fails loud too.
     const nbad = sa3GuidanceFromJson("{\"prompt\":\"jazz\",\"cfg_scale\":3,\"negative_prompt\":42}");
     try testing.expect(nbad.err != null);
+}
+
+test "sa3A2aFromJson + a2aFieldRefusal: audio-to-audio parse, σmax floor, engine pairing" {
+    // Defaults: σmax 1.0 (pure text-to-audio, reference default), no init.
+    const d = sa3A2aFromJson("{\"prompt\":\"rain\"}");
+    try testing.expect(d.err == null);
+    try testing.expectEqual(@as(f32, 1.0), d.init_noise_level);
+    try testing.expect(d.init_audio_raw == null);
+
+    // σmax parses; below the reference floor (MIN_SIGMA 0.01) it names itself.
+    const ok = sa3A2aFromJson("{\"prompt\":\"rain\",\"init_noise_level\":0.5}");
+    try testing.expect(ok.err == null);
+    try testing.expectEqual(@as(f32, 0.5), ok.init_noise_level);
+    const low = sa3A2aFromJson("{\"prompt\":\"rain\",\"init_noise_level\":0.005}");
+    try testing.expect(low.err != null);
+    try testing.expect(std.mem.indexOf(u8, low.err.?, "init_noise_level") != null);
+
+    // non-numeric fails LOUD — never a silent default. extractJsonFloat's
+    // own contract is "no exponent" (gen params don't need it): the scan
+    // stops at 'e', so 1e400 parses as plain 1, not inf — pinned here so
+    // nobody mistakes it for an overflow check.
+    const bad = sa3A2aFromJson("{\"prompt\":\"rain\",\"init_noise_level\":\"half\"}");
+    try testing.expect(bad.err != null);
+    const noexp = sa3A2aFromJson("{\"prompt\":\"rain\",\"init_noise_level\":1e400}");
+    try testing.expect(noexp.err == null);
+    try testing.expectEqual(@as(f32, 1.0), noexp.init_noise_level);
+
+    // No upper bound above 1.0 (the reference --init-noise-level has none).
+    const hi = sa3A2aFromJson("{\"prompt\":\"rain\",\"init_noise_level\":1.8}");
+    try testing.expect(hi.err == null);
+    try testing.expectEqual(@as(f32, 1.8), hi.init_noise_level);
+
+    // init_audio keeps its raw string for the handler to base64/WAV-decode;
+    // "" normalizes to absent (nothing to encode), wrong type fails loud.
+    const ia = sa3A2aFromJson("{\"prompt\":\"rain\",\"init_audio\":\"UklGRg==\"}");
+    try testing.expect(ia.err == null);
+    try testing.expectEqualStrings("UklGRg==", ia.init_audio_raw.?);
+    const iaempty = sa3A2aFromJson("{\"prompt\":\"rain\",\"init_audio\":\"\"}");
+    try testing.expect(iaempty.err == null);
+    try testing.expect(iaempty.init_audio_raw == null);
+    const iabad = sa3A2aFromJson("{\"prompt\":\"rain\",\"init_audio\":42}");
+    try testing.expect(iabad.err != null);
+
+    // On ACE-Step / MiniMax both fields refuse by name — a silently dropped
+    // init_audio would hand back audio that ignored what was asked for.
+    try testing.expect(a2aFieldRefusal("{\"prompt\":\"x\",\"init_audio\":\"AAA=\"}") != null);
+    try testing.expect(a2aFieldRefusal("{\"prompt\":\"x\",\"init_noise_level\":0.5}") != null);
+    try testing.expect(a2aFieldRefusal("{\"prompt\":\"x\",\"cfg_scale\":3}") == null);
+    try testing.expect(a2aFieldRefusal("{\"prompt\":\"x\",\"src_audio\":\"AAA=\"}") == null);
 }
 
 test "videoRgbTransportReason: chained windows are billed into the response cap (#283)" {
