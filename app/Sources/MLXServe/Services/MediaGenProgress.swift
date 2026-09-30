@@ -44,12 +44,17 @@ struct MediaGenProgress: Equatable {
 /// services so the chat sees one taxonomy no matter which modality ran.
 enum MediaGenError: LocalizedError {
     case emptyInput(String)
+    /// The message IS the failure — no "is empty." suffix, because a
+    /// configuration refusal ("inpaint range must sit inside the track")
+    /// reads wrong once a subject and a verb are glued to it.
+    case invalidInput(String)
     case notDownloaded(String)
     case server(String)
 
     var errorDescription: String? {
         switch self {
         case .emptyInput(let what):  return "\(what) is empty."
+        case .invalidInput(let m):   return m
         case .notDownloaded(let n):  return "\(n) is not downloaded."
         case .server(let m):         return m
         }

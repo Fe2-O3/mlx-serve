@@ -254,6 +254,129 @@ final class MusicGenTests: XCTestCase {
         XCTAssertEqual(fromOld.initNoiseLevel, 1.0, "σmax 1.0 = pure text-to-audio, the reference default")
     }
 
+    /// Stage 4 of the SA3 port: inpainting. `inpaint_range: [start, end]` in
+    /// seconds regenerates that slice of the seed clip and keeps the rest. It
+    /// rides only to the one family that reads it (the others name it a 400
+    /// beside `init_audio`), and — unlike every other optional field —
+    /// `requestBody` must NOT drop it when the clip is missing: a run that
+    /// ignored the range is worse than a 400, because the 400 says so and the
+    /// ignored run does not.
+    func testStableAudio3InpaintRangeIsGatedAndOnTheWire() throws {
+        XCTAssertTrue(MusicModelPreset.stableAudio3Medium.supportsInpaint)
+        for p in MusicModelPreset.all {
+            XCTAssertEqual(p.supportsInpaint, p.family == .stableAudio3, p.id)
+        }
+
+        var on = MusicGenRequest(model: .stableAudio3Medium, prompt: "piano")
+        on.initAudioPath = "/tmp/init.wav"
+        on.inpaintRange = (start: 0.5, end: 2.0)
+        let body = MusicGenService.requestBody(on, modelName: "sa3", initAudioB64: "UklGRg==")
+        XCTAssertEqual(try XCTUnwrap(body["inpaint_range"] as? [Double]), [0.5, 2.0])
+        XCTAssertEqual(body["init_audio"] as? String, "UklGRg==")
+        let txt = MusicGenService.settingsText(on, resolvedSeed: 7, modelName: "sa3")
+        XCTAssertTrue(txt.contains("inpaint_range: 0.5 - 2.0"),
+                      "the sidecar must record the range that ran")
+
+        // A range with no clip still reaches the server, so the server's own
+        // pairing 400 names it. `generate` refuses first with a sentence (see
+        // testInpaintRefusalNamesWhyItCannotRun) — this is the backstop for
+        // the agent path and for a clip that became unreadable mid-flight.
+        var noclip = MusicGenRequest(model: .stableAudio3Medium, prompt: "piano")
+        noclip.inpaintRange = (start: 0.5, end: 2.0)
+        let bare = MusicGenService.requestBody(noclip, modelName: "sa3")
+        XCTAssertNotNil(bare["inpaint_range"],
+                        "silently dropping the range would hand back audio that ignored it")
+        XCTAssertNil(bare["init_audio"])
+
+        // Sticky across a model switch: the other families refuse it by name.
+        var ace = MusicGenRequest(model: .acestepXLTurbo8bit, prompt: "piano")
+        ace.initAudioPath = "/tmp/init.wav"
+        ace.inpaintRange = (start: 0.5, end: 2.0)
+        XCTAssertNil(MusicGenService.requestBody(ace, modelName: "ace")["inpaint_range"])
+        XCTAssertFalse(MusicGenService.settingsText(ace, resolvedSeed: 1, modelName: "ace")
+            .contains("inpaint_range"))
+
+        // The server's own refusals are the contract these gates exist to
+        // satisfy — pin both spellings so a server change surfaces here
+        // rather than in a live 400.
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent()
+        let gen = try String(contentsOf: root.appendingPathComponent("src/gen.zig"), encoding: .utf8)
+        XCTAssertTrue(gen.contains("'inpaint_range' must satisfy 0 <= start < end <= duration_seconds"),
+                      "src/gen.zig no longer states the inpaint range constraint")
+        XCTAssertTrue(gen.contains("'inpaint_range' needs a non-empty 'init_audio'"),
+                      "src/gen.zig no longer pairs inpaint_range with init_audio")
+    }
+
+    /// The pane shows a SENTENCE when inpainting cannot run, not a 400's JSON.
+    /// The refusal runs only where the field is actually sent — a sticky
+    /// range on ACE-Step is dropped by the gate and must not block that
+    /// engine's run.
+    func testInpaintRefusalNamesWhyItCannotRun() {
+        XCTAssertNil(MusicGenRequest.inpaintRefusal(model: .stableAudio3Medium, inpaintRange: nil,
+                                                    initAudioPath: "/tmp/init.wav", durationSeconds: 60))
+        XCTAssertNil(MusicGenRequest.inpaintRefusal(model: .acestepXLTurbo8bit,
+                                                    inpaintRange: (start: 0.5, end: 2.0),
+                                                    initAudioPath: nil, durationSeconds: 60),
+                     "a sticky value on another family must not block that family's run")
+
+        // The pairing: there is nothing to inpaint INTO.
+        let noclip = MusicGenRequest.inpaintRefusal(model: .stableAudio3Medium,
+                                                    inpaintRange: (start: 0.5, end: 2.0),
+                                                    initAudioPath: nil, durationSeconds: 60)
+        XCTAssertNotNil(noclip)
+        XCTAssertTrue(noclip!.contains("seed audio file"), noclip!)
+        XCTAssertNotNil(MusicGenRequest.inpaintRefusal(model: .stableAudio3Medium,
+                                                       inpaintRange: (start: 0.5, end: 2.0),
+                                                       initAudioPath: "", durationSeconds: 60))
+
+        // `0 <= start < end <= duration_seconds`, against the SAME clamped
+        // duration the body sends (sticky values outlive a model switch).
+        let inverted = MusicGenRequest.inpaintRefusal(model: .stableAudio3Medium,
+                                                      inpaintRange: (start: 2.0, end: 0.5),
+                                                      initAudioPath: "/tmp/init.wav", durationSeconds: 60)
+        XCTAssertNotNil(inverted)
+        XCTAssertNotNil(MusicGenRequest.inpaintRefusal(model: .stableAudio3Medium,
+                                                       inpaintRange: (start: -1.0, end: 2.0),
+                                                       initAudioPath: "/tmp/init.wav", durationSeconds: 60))
+        XCTAssertNotNil(MusicGenRequest.inpaintRefusal(model: .stableAudio3Medium,
+                                                       inpaintRange: (start: 0.5, end: Double.nan),
+                                                       initAudioPath: "/tmp/init.wav", durationSeconds: 60))
+        let past = MusicGenRequest.inpaintRefusal(model: .stableAudio3Medium,
+                                                  inpaintRange: (start: 0.5, end: 61.0),
+                                                  initAudioPath: "/tmp/init.wav", durationSeconds: 60)
+        XCTAssertNotNil(past)
+        XCTAssertTrue(past!.contains("60 s"), past!)
+
+        // The happy path: the range the fixture dump used.
+        XCTAssertNil(MusicGenRequest.inpaintRefusal(model: .stableAudio3Medium,
+                                                    inpaintRange: (start: 4.0, end: 9.0),
+                                                    initAudioPath: "/tmp/init.wav", durationSeconds: 15))
+    }
+
+    func testMusicInpaintSettingsRoundTripAndDecodeLegacyBlobs() throws {
+        var s = MusicGenSettings()
+        s.inpaintEnabled = true
+        s.inpaintStart = 4.0
+        s.inpaintEnd = 9.0
+        let data = try JSONEncoder().encode(s)
+        let back = try JSONDecoder().decode(MusicGenSettings.self, from: data)
+        XCTAssertEqual(back.inpaintEnabled, true)
+        XCTAssertEqual(back.inpaintStart, 4.0)
+        XCTAssertEqual(back.inpaintEnd, 9.0)
+
+        var legacy = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        legacy.removeValue(forKey: "inpaintEnabled")
+        legacy.removeValue(forKey: "inpaintStart")
+        legacy.removeValue(forKey: "inpaintEnd")
+        let old = try JSONSerialization.data(withJSONObject: legacy)
+        let fromOld = try JSONDecoder().decode(MusicGenSettings.self, from: old)
+        XCTAssertFalse(fromOld.inpaintEnabled, "a blob written before inpainting decodes with the feature off")
+        XCTAssertEqual(fromOld.inpaintStart, 0.0)
+        XCTAssertEqual(fromOld.inpaintEnd, 9.0)
+    }
+
     func testReferenceAudioIsDeclaredPerFamilyAndSentOnlyThere() {
         // ACE-Step has a timbre slot; Music 3 names `ref_audio` a 400. The
         // preset flag gates the control AND the field, so a clip left behind
@@ -359,6 +482,29 @@ final class MusicGenTests: XCTestCase {
         }
         // The service is what reads the clip — the pane alone never sends it.
         XCTAssertTrue(src.contains("initAudioPath: initAudioURL?.path"))
+    }
+
+    /// The unreachable-affordance class, stage 4: the inpaint toggle and its
+    /// two sliders must be RENDERED, the pair must reach the request, and the
+    /// SERVICE must be what refuses a range that cannot run — a control never
+    /// drawn, or drawn but never read, does nothing.
+    func testInpaintControlsExistInThePane() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let view = try String(contentsOf: root.appendingPathComponent("Sources/MLXServe/Views/MusicGenView.swift"),
+                              encoding: .utf8)
+        for needle in ["value: $inpaintStart", "value: $inpaintEnd",
+                       "inpaintRange: inpaintEnabled",
+                       "inpaintEnabled = s.inpaintEnabled",
+                       "s.inpaintEnabled = inpaintEnabled"] {
+            XCTAssertTrue(view.contains(needle), "MusicGenView has no control for \(needle)")
+        }
+        let svc = try String(contentsOf: root.appendingPathComponent("Sources/MLXServe/Services/MusicGenService.swift"),
+                             encoding: .utf8)
+        XCTAssertTrue(svc.contains("inpaintRefusal"),
+                      "MusicGenService never refuses a range that cannot run — the server's 400 JSON is not a message")
+        XCTAssertTrue(svc.contains("\"inpaint_range\""),
+                      "MusicGenService never puts the range on the wire")
     }
 
     // MARK: - Request wire contract

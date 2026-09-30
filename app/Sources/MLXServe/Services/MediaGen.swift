@@ -1486,6 +1486,12 @@ struct MusicModelPreset: Identifiable, Hashable {
     /// 400, so the well AND the fields are gated together (sticky values
     /// survive a model switch, like the guidance gate above).
     var supportsInitAudio: Bool { family == .stableAudio3 }
+    /// Inpainting (server `inpaint_range`): regenerate a seconds range of the
+    /// seed clip and keep the rest. Same family as `supportsInitAudio` — a
+    /// range without a clip has nothing to keep, and the server pairs them —
+    /// but its own gate so a family that someday learns audio-to-audio
+    /// without inpainting does not receive a field it would 400.
+    var supportsInpaint: Bool { family == .stableAudio3 }
 
     /// ACE-Step v1.5 XL Turbo, 8-bit — 4B-class DiT, 8-step distilled.
     /// Published converted repo (DiT+encoders, Oobleck VAE, Qwen3-Embedding
@@ -1547,6 +1553,28 @@ extension MusicGenRequest {
                                 instrumental: Bool) -> Bool {
         if !model.requiresLyrics || instrumental { return true }
         return !lyrics.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// Why this inpainting request cannot run as configured, or nil when it
+    /// can. Mirrors the server's own pairing check (`inpaint_range` needs a
+    /// non-empty `init_audio`, `0 <= start < end <= duration_seconds`) so the
+    /// pane shows a sentence instead of a 400's JSON — and it runs ONLY where
+    /// the field is actually sent: a sticky range on another family is
+    /// dropped by `requestBody`'s gate and must not block that family's run.
+    /// The duration is clamped exactly like the body clamps it, so both agree
+    /// about which track the range has to fit inside.
+    static func inpaintRefusal(model: MusicModelPreset, inpaintRange: (start: Double, end: Double)?,
+                               initAudioPath: String?, durationSeconds: Int) -> String? {
+        guard let w = inpaintRange, model.supportsInpaint else { return nil }
+        let hasClip = initAudioPath.map { !$0.isEmpty } ?? false
+        guard hasClip else { return "Inpainting needs a seed audio file — pick the clip to keep." }
+        let r = model.durationRange
+        let dur = Int(min(max(Double(durationSeconds), r.lowerBound), r.upperBound))
+        guard w.start.isFinite, w.end.isFinite,
+              w.start >= 0, w.start < w.end, w.end <= Double(dur) else {
+            return "Inpaint range \(w.start)-\(w.end) s must satisfy 0 <= start < end <= \(dur) s."
+        }
+        return nil
     }
 }
 
@@ -2317,6 +2345,13 @@ struct MusicGenRequest {
     /// text-to-audio, lower keeps more of the clip. Sent where
     /// `supportsInitAudio` even with no clip (a schedule effect on its own).
     var initNoiseLevel: Double = 1.0
+    /// Inpainting window (server `inpaint_range`, SA3 only): regenerate
+    /// `[start, end)` seconds of the seed clip and keep the rest. nil = off.
+    /// A pair of Doubles rather than a `ClosedRange`: the pane's two sliders
+    /// CAN drift into `start >= end`, and that invalid pair is a message the
+    /// user needs (`inpaintRefusal`) — a type that refused to hold it would
+    /// turn it into a trap instead. Only sent where `supportsInpaint`.
+    var inpaintRange: (start: Double, end: Double)? = nil
     /// Complete: instruments to add, from `MusicTask.trackClasses`; empty =
     /// the model decides.
     var trackClasses: [String] = []

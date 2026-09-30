@@ -135,6 +135,14 @@ final class MusicGenService: ObservableObject {
                 body["init_audio"] = initAudioB64
             }
         }
+        // Stage-4 inpainting is Stable Audio 3's alone like the two above.
+        // Deliberately NOT paired with `init_audio` here: dropping the range
+        // when the clip is missing would hand back a track that ignored it,
+        // and a 400 naming the pairing is the honest failure. `generate`
+        // refuses first with a sentence — see `MusicGenRequest.inpaintRefusal`.
+        if request.model.supportsInpaint, let w = request.inpaintRange {
+            body["inpaint_range"] = [w.start, w.end]
+        }
         // -1 = fresh random seed, resolved HERE so the log can show it.
         body["seed"] = request.seed >= 0 ? request.seed : Int.random(in: 0..<1_000_000_000)
         return body
@@ -205,6 +213,11 @@ final class MusicGenService: ObservableObject {
                 lines.append("init_audio: \((path as NSString).lastPathComponent)")
             }
         }
+        // Inpainting mirrors the body's gate exactly: a model that never
+        // receives the range gets no record of it either.
+        if request.model.supportsInpaint, let w = request.inpaintRange {
+            lines.append("inpaint_range: \(w.start) - \(w.end)")
+        }
         var out = lines.joined(separator: "\n")
         out += "\n\n# Style prompt\n" + request.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         // Gated like the body: a model that never receives lyrics gets no
@@ -273,6 +286,15 @@ final class MusicGenService: ObservableObject {
         if request.model.supportsInitAudio, let p = request.initAudioPath, !p.isEmpty,
            !FileManager.default.fileExists(atPath: p) {
             phase = .failed("The seed audio file is missing — pick it again.")
+            return
+        }
+        // Same fail-loud for the range: the server would 400 the pairing or
+        // the bounds, but a 400's JSON is not a message the pane can show.
+        if let refusal = MusicGenRequest.inpaintRefusal(model: request.model,
+                                                        inpaintRange: request.inpaintRange,
+                                                        initAudioPath: request.initAudioPath,
+                                                        durationSeconds: request.durationSeconds) {
+            phase = .failed(refusal)
             return
         }
         // TEMPORARY migration (2026-08-22): a pack downloaded before cover mode
@@ -395,6 +417,12 @@ final class MusicGenService: ObservableObject {
         if request.model.supportsInitAudio, let p = request.initAudioPath, !p.isEmpty,
            !FileManager.default.fileExists(atPath: p) {
             throw MediaGenError.emptyInput("Seed audio file (missing — pick it again)")
+        }
+        if let refusal = MusicGenRequest.inpaintRefusal(model: request.model,
+                                                        inpaintRange: request.inpaintRange,
+                                                        initAudioPath: request.initAudioPath,
+                                                        durationSeconds: request.durationSeconds) {
+            throw MediaGenError.invalidInput(refusal)
         }
 
         let outputPath = Self.makeOutputPath(prompt: request.prompt)

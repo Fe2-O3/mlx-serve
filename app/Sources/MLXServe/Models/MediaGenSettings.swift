@@ -275,6 +275,13 @@ struct MusicGenSettings: Codable, Equatable {
     var initAudioPath: String? = nil
     /// σmax floor is 0.01 server-side; 1.0 (default) = pure text-to-audio.
     var initNoiseLevel: Double = 1.0
+    /// Stage-4 inpainting (Stable Audio 3 only on the wire): whether the pane
+    /// regenerates a slice of the seed clip, and which slice. Off by default;
+    /// every key `decodeIfPresent` so a blob written before this decodes
+    /// unchanged (the migration rule for every field on this struct).
+    var inpaintEnabled: Bool = false
+    var inpaintStart: Double = 0.0
+    var inpaintEnd: Double = 9.0
 
     private static let storageKey = "musicGenSettings"
 
@@ -336,6 +343,9 @@ extension MusicGenSettings {
         if let v = try c.decodeIfPresent(Double.self, forKey: .apg) { apg = v }
         initAudioPath = try c.decodeIfPresent(String.self, forKey: .initAudioPath)
         if let v = try c.decodeIfPresent(Double.self, forKey: .initNoiseLevel) { initNoiseLevel = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .inpaintEnabled) { inpaintEnabled = v }
+        if let v = try c.decodeIfPresent(Double.self, forKey: .inpaintStart) { inpaintStart = v }
+        if let v = try c.decodeIfPresent(Double.self, forKey: .inpaintEnd) { inpaintEnd = v }
     }
 }
 

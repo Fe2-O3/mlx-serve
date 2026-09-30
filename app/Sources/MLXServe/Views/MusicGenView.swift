@@ -79,6 +79,14 @@ struct MusicGenView: View {
     @State private var isInitAudioDropTargeted: Bool = false
     @State private var initAudioBusy: Bool = false
     @State private var initNoiseLevel: Double = 1.0
+    // Stage-4 inpainting (Stable Audio 3 only): regenerate a slice of the
+    // seed clip and keep the rest. Two Doubles rather than a ClosedRange so
+    // a drift between the sliders becomes a sentence (`inpaintRefusal`)
+    // instead of a trap while constructing the range. Sticky like the rest —
+    // `requestBody` drops it on any other family.
+    @State private var inpaintEnabled: Bool = false
+    @State private var inpaintStart: Double = 0.0
+    @State private var inpaintEnd: Double = 9.0
     /// Keep the model resident after generating (default off → unload).
     @State private var keepResident: Bool = false
     /// Hydration guard — see ImageGenView for the full rationale.
@@ -651,10 +659,58 @@ struct MusicGenView: View {
                     .font(.app(.caption2)).foregroundStyle(.secondary)
             }
             .padding(.top, 4)
+            if model.supportsInpaint {
+                VStack(alignment: .leading, spacing: 2) {
+                    Toggle(isOn: $inpaintEnabled) {
+                        Text("Inpaint a range").font(.app(.caption))
+                    }
+                    .toggleStyle(.checkbox)
+                    .disabled(initAudioURL == nil)
+                    .help("Regenerate only a slice of the seed clip and keep the rest of it.")
+                    if inpaintEnabled {
+                        HStack(spacing: 6) {
+                            Text("Regenerate from").font(.app(.caption2))
+                            Spacer()
+                            Text(String(format: "%.2f s", inpaintStart))
+                                .font(.app(.caption2).monospacedDigit()).foregroundStyle(.secondary)
+                        }
+                        Slider(value: $inpaintStart, in: 0...max(0.1, durationSeconds - 0.1), step: 0.01)
+                        HStack(spacing: 6) {
+                            Text("to").font(.app(.caption2))
+                            Spacer()
+                            Text(String(format: "%.2f s", inpaintEnd))
+                                .font(.app(.caption2).monospacedDigit()).foregroundStyle(.secondary)
+                        }
+                        Slider(value: $inpaintEnd, in: 0.1...max(0.1, durationSeconds), step: 0.01)
+                        Text(inpaintCaption)
+                            .font(.app(.caption2)).foregroundStyle(.secondary)
+                    }
+                }
+                .padding(.top, 4)
+            }
         }
         .mediaDrop(.audio, isTargeted: $isInitAudioDropTargeted) { urls in
             if let url = urls.first { acceptInitAudio(url) }
         }
+        .onChange(of: inpaintStart) { _, v in
+            // The two sliders can cross; nudge the other back inside the pair
+            // rather than let an impossible range reach Generate.
+            if v >= inpaintEnd { inpaintEnd = min(durationSeconds, v + 0.1) }
+        }
+        .onChange(of: inpaintEnd) { _, v in
+            if v <= inpaintStart { inpaintStart = max(0, v - 0.1) }
+        }
+    }
+
+    /// What the range controls say under the sliders — the same three
+    /// reasons `inpaintRefusal` would refuse at Generate time, said while
+    /// there is still something to do about it.
+    private var inpaintCaption: String {
+        if initAudioURL == nil { return "Inpainting needs the seed audio file above." }
+        if inpaintStart >= inpaintEnd { return "Start must come before the end." }
+        let dur = Int(durationSeconds)
+        if inpaintEnd > Double(dur) { return "The range must end inside the \(dur) s track." }
+        return "Regenerates \(String(format: "%.2f", inpaintEnd - inpaintStart)) s — the rest of your clip is kept."
     }
 
     private func chooseInitAudioFile() {
@@ -689,6 +745,9 @@ struct MusicGenView: View {
     private func clearInitAudio() {
         if let url = initAudioURL { try? FileManager.default.removeItem(at: url) }
         initAudioURL = nil
+        // Inpainting regenerates a slice of THAT clip — with nothing to keep,
+        // a left-behind ON toggle would be a checked control that cannot run.
+        inpaintEnabled = false
     }
 
     /// Best-per-capability up front, everything else behind "Other Models", and
@@ -1107,6 +1166,11 @@ struct MusicGenView: View {
         // Clamp into the server's legal range: a blob edited by hand (or a
         // future slider range) must not reach a 400 on the σmax floor.
         initNoiseLevel = min(max(s.initNoiseLevel, 0.01), 1.0)
+        inpaintEnabled = s.inpaintEnabled
+        // Floors only: a range that runs past the track stays OUT OF BOUNDS
+        // on purpose, so the caption says so instead of being quietly cut.
+        inpaintStart = max(0, s.inpaintStart)
+        inpaintEnd = max(0.1, s.inpaintEnd)
     }
 
     /// Every sticky field, as the blob it would persist to — `Equatable`, so
@@ -1138,6 +1202,9 @@ struct MusicGenView: View {
         s.apg = apg
         s.initAudioPath = initAudioURL?.path
         s.initNoiseLevel = initNoiseLevel
+        s.inpaintEnabled = inpaintEnabled
+        s.inpaintStart = inpaintStart
+        s.inpaintEnd = inpaintEnd
         return s
     }
 
@@ -1272,6 +1339,7 @@ struct MusicGenView: View {
             apg: apg,
             initAudioPath: initAudioURL?.path,
             initNoiseLevel: initNoiseLevel,
+            inpaintRange: inpaintEnabled ? (start: inpaintStart, end: inpaintEnd) : nil,
             trackClasses: trackClasses,
             lanModelId: lanModel
         )
