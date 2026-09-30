@@ -60,7 +60,7 @@ curl http://localhost:11234/v1/responses \
 - `POST /v1/embeddings` —— 文本嵌入（BERT、EmbeddingGemma，以及 Qwen3-Embedding 这类末位 Token 池化模型；池化方式跟随检查点的 sentence-transformers 元数据，`dimensions` 会截断并重新归一化）
 - `POST /v1/images/generations`、`POST /v1/images/edits` —— 图像生成与按指令编辑；edits 端点采用 OpenAI SDK 的 multipart 形态（`client.images.edit`），包括用重复的 `image[]` 传多张参考图
 - `POST /v1/audio/speech` —— Qwen3-TTS（`ref_audio` 克隆音色）或 Kokoro（`voice` 从 54 种音色中挑选或混合），输出 WAV
-- `POST /v1/audio/music-generations` —— 文生音乐，输出 WAV：ACE-Step（48 kHz 立体声，快）或 MiniMax Music 3（必须提供 `lyrics`，44.1 kHz，歌曲最长六分钟）
+- `POST /v1/audio/music-generations` —— 文生音乐，输出 WAV：ACE-Step（48 kHz 立体声，快）、MiniMax Music 3（必须提供 `lyrics`，44.1 kHz，歌曲最长六分钟）或 Stable Audio 3（只接受 `prompt` —— 文生音频的声音/氛围/器乐音乐，44.1 kHz，最长 384 秒；没有歌词或速度字段）
 - `POST /v1/video/generations` —— LTX-Video 2.3 / 2.5 或 MiniMax-H3；base64 的 `rgb8` 帧加 `pcm_s16le` 音频，封装由你自己完成。LTX 2.5 传 `"decoder": "diffusion"` 可使用更锐利的 diffusion 解码器；较长的 H3 片段通过 `chain_windows` 串联。在 `"stream": true` 时选传 `"preview": true`，会给每个去噪 `progress` 事件附上一张 Latent2RGB JPEG（`preview_frames`、`preview_max_side`）
 - `POST /v1/3d/generations` —— Hunyuan3D-2.1，base64 的 GLB
 - `POST /v1/load-model`、`POST /v1/unload-model` —— 加载已发现的模型（也可按绝对路径加载），立即释放一个模型；`"default": true` 会让刚加载的模型成为对外服务的默认模型，无需重启

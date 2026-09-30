@@ -18,7 +18,6 @@ BIN="$ROOT/zig-out/bin/mlx-serve"
 [ -x "$BIN" ] || { echo "FAIL: build first (zig build -Doptimize=ReleaseFast)"; exit 1; }
 
 SA3="${SA3_MODEL:-$(ls -d ~/.mlx-serve/models/*stable-audio* 2>/dev/null | head -1)}"
-[ -n "$SA3" ] || SA3="$(ls -d ~/claude-tmp/sa3/pack-medium-8bit 2>/dev/null | head -1)"
 CHAT="${CHAT_MODEL:-$(ls -d ~/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit 2>/dev/null | head -1)}"
 [ -n "$SA3" ] || { echo "SKIP: no Stable Audio 3 pack (set SA3_MODEL to a converted dir)"; exit 0; }
 [ -f "$SA3/config.json" ] || { echo "SKIP: $SA3 has no config.json"; exit 0; }

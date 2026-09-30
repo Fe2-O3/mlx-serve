@@ -46,6 +46,7 @@ Zig 0.17 (pinned nightly via `scripts/fetch-zig.sh`; brew 0.16 no longer builds)
 | `hunyuan3d.zig` / `hunyuan3d_paint*.zig` | 3D shape + texture paint; converted layouts BAKE OUT per-head QKV interleaves — never "fix" it |
 | `acestep.zig` | ACE-Step music (Qwen3 encoder, AdaLN DiT, Euler flow-match, Oobleck VAE 48 kHz; Snake/encode f32) |
 | `music3.zig` | MiniMax Music 3: Qwen3-8B global LLM (batch-2 CFG) + depth decoder → hidden states condition a flow DiT (temb as TOKEN) + Snake/DAC vocoder 44.1 kHz |
+| `stable_audio3.zig` | Stable Audio 3 medium: T5Gemma prompt encoder → f32 conditioner → differential-attention DiT ping-pong sampler (default 8 steps, redraw chain `key(seed+1)`) → SAME-L decoder 44.1 kHz; text-to-audio only, `SA3_*` env oracles |
 | `ltx_video.zig` / `ltx_audio.zig` | LTX video (one/two-stage/HQ, i2v, a2vid) + audio VAE/BigVGAN. `LtxVersion` (from `model_version`) keys 2.3-vs-2.5: text encoder, `ff_bias`, `keyframes_abs_pos_embedding` |
 | `ltx_diffvae*.zig` | LTX-2.5 DiffVAE decoder (`"decoder":"diffusion"`): geometry/tiling, fused 3D NA Metal kernel, MLX pass. Sampler contract is MEASURED (x0, 1 step, timesteps x1000) |
 | `minimax_h3*.zig` | MiniMax-H3 text-to-audio-video: joint video+audio DiT, staged residency, fast recipe, Turbo LoRA, chained windows — detail in `docs/reference.md` |
@@ -144,7 +145,7 @@ Dispatch on `config.json` `model_type`. GGUF bypasses MLX → embedded engine by
 | `*.gguf` | ds4/llama.cpp; GGUF presence WINS over stray config.json. ds4 DSpark: `--dspark` arms when a `-DSpark-` GGUF sits beside the model (gate keys on `mtpDraftTokens()>1` NOT `hasMtp()`); ~0 net on 0731 |
 | `minimax_h3` | MiniMax-H3 text-to-audio-video: joint denoise, 17k+5 frame ladder, 24 fps, two partitions (fl2va/ref2va — `tasks` is the ONLY discriminator), Turbo LoRA, chained windows, fast recipe default-on |
 | `laya` | Laya typed-decision checkpoints (no root config.json — classified from `encoder/config.json` + `rl_agent_config.json` by `model_discovery.peekLayaCheckpoint`, `gen.peekModelType` delegates; app twin `DownloadManager.configlessModelType` + `MediaBundle.laya`): ModernBERT encoder (RoPE, GeGLU, global/sliding bool masks) + 2 head layers + marker scorer + act head, fp16; tokenizer.json `Metaspace` pre-tokenizer implemented in `tokenizer.zig` |
-| media types | `flux2*`/`krea*`/`mage_flow*`/`qwen_image*` (unified t2i+edit)/`qwen3_tts`/`acestep`/`minimax_music3`/`AudioVideo` (LTX 2.3 + 2.5 by `model_version`)/`hunyuan3d*` → gen.zig slots (`mage_flow` + the mlx-community qwen21 spelling have NO root config.json — classified from `model_index.json` by `gen.peekModelType` + `model_discovery`, kept in sync) |
+| media types | `flux2*`/`krea*`/`mage_flow*`/`qwen_image*` (unified t2i+edit)/`qwen3_tts`/`acestep`/`minimax_music3`/`stable_audio3`/`AudioVideo` (LTX 2.3 + 2.5 by `model_version`)/`hunyuan3d*` → gen.zig slots (`mage_flow` + the mlx-community qwen21 spelling have NO root config.json — classified from `model_index.json` by `gen.peekModelType` + `model_discovery`, kept in sync) |
 
 Models with `vision_config` but no vision weights disable vision. Embedded-engine detail: `docs/reference.md`.
 

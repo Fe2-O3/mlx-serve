@@ -22,6 +22,6 @@
 | **嵌入** | `bert`, `gemma3_text`, `qwen3` | bge、mxbai、EmbeddingGemma、Qwen3-Embedding（池化方式从检查点读取） | n/a | -- |
 | **其它一切以 GGUF 形式** | 通过内置 llama.cpp | HuggingFace 上任何 `.gguf` | 按模板 | -- |
 
-媒体模型位于同一个注册表里，分类方式也相同：FLUX.2、Krea-2 和 Mage-Flow（图像），Qwen3-TTS、Kokoro、ACE-Step 和 MiniMax Music 3（语音 + 音乐），LTX-Video 2.3 / 2.5 和 MiniMax-H3（视频），Hunyuan3D-2.1（3D）。聊天请求里点名其中之一，会收到一个 400，并指出应改用哪个端点。
+媒体模型位于同一个注册表里，分类方式也相同：FLUX.2、Krea-2 和 Mage-Flow（图像），Qwen3-TTS、Kokoro、ACE-Step、MiniMax Music 3 和 Stable Audio 3（语音 + 音乐），LTX-Video 2.3 / 2.5 和 MiniMax-H3（视频），Hunyuan3D-2.1（3D）。聊天请求里点名其中之一，会收到一个 400，并指出应改用哪个端点。
 
 任何使用上述架构之一的量化 MLX 模型都能原生运行。其它一切都可以通过内置 llama.cpp 引擎以 GGUF 形式提供 —— 只要在模型浏览器里挑中那个 `.gguf` 文件，服务器就会按格式自动路由。架构不受支持的模型会在模型浏览器里标注出来，但仍然可以下载。

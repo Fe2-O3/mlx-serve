@@ -21,11 +21,11 @@
 - **基于提示词的技能** —— 把带 YAML frontmatter 的 `.md` 文件放进 `~/.mlx-serve/skills/`，即可教给 Agent 由关键词触发的自定义能力；或者在聊天框里输入 `/` 挑一个技能，在任何聊天中按名字运行它，无论是否处于 Agent 模式。
 - **引擎感知的设置窗口**（Cmd+,）—— 每一项服务器启动参数与每个请求的默认值，分区只显示与你已加载引擎相关的旋钮（MLX vs GGUF vs ds4）。
 - **服务器管理** —— 启动 / 停止、实时日志缓冲、参数变更后提示重启的横幅。
-- **图像 / 视频 / 音乐 / 语音 / 3D 生成** —— FLUX.2、Krea-2、Mage-Flow、LTX-Video 2.3 / 2.5、MiniMax-H3、ACE-Step、MiniMax Music 3、Qwen3-TTS、Kokoro 和 Hunyuan3D，全部通过 mlx-serve zig 服务器原生运行。
+- **图像 / 视频 / 音乐 / 语音 / 3D 生成** —— FLUX.2、Krea-2、Mage-Flow、LTX-Video 2.3 / 2.5、MiniMax-H3、ACE-Step、MiniMax Music 3、Stable Audio 3、Qwen3-TTS、Kokoro 和 Hunyuan3D，全部通过 mlx-serve zig 服务器原生运行。
 
 ## 图像 / 视频 / 音乐 / 语音 / 3D 生成
 
-一个服务器，五种模态 —— **Image**、**Video**、**Audio**（语音 + 音乐）和 **3D** 创建面板。它们在 MLX 上原生运行 [FLUX.2](https://huggingface.co/black-forest-labs) / Krea-2 / Microsoft Mage-Flow、[LTX-Video 2.3 与 2.5](https://github.com/dgrauet/ltx-2-mlx) / [MiniMax-H3](https://huggingface.co/ddalcu/MiniMax-H3-FL2VA-MLX-Serve-8bit)、[ACE-Step 1.5](https://huggingface.co/ddalcu/ACE-Step-1.5-XL-Turbo-MLX-Serve-8bit) / MiniMax Music 3、[Qwen3-TTS](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base) / [Kokoro-82M](https://huggingface.co/ddalcu/Kokoro-82M-MLX-Serve)，以及 [Hunyuan3D-2.1](https://huggingface.co/ddalcu/Hunyuan3D-2.1-MLX-Serve-8bit)。点开一个面板，按 **Download**，生成。把文件拖到任何面板上，它会落到正确的槽位，参考图列表也包括在内。每个面板都会在会话之间记住你上次用的模型、质量、分辨率、步数和 seed。
+一个服务器，五种模态 —— **Image**、**Video**、**Audio**（语音 + 音乐）和 **3D** 创建面板。它们在 MLX 上原生运行 [FLUX.2](https://huggingface.co/black-forest-labs) / Krea-2 / Microsoft Mage-Flow、[LTX-Video 2.3 与 2.5](https://github.com/dgrauet/ltx-2-mlx) / [MiniMax-H3](https://huggingface.co/ddalcu/MiniMax-H3-FL2VA-MLX-Serve-8bit)、[ACE-Step 1.5](https://huggingface.co/ddalcu/ACE-Step-1.5-XL-Turbo-MLX-Serve-8bit) / MiniMax Music 3 / Stable Audio 3、[Qwen3-TTS](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base) / [Kokoro-82M](https://huggingface.co/ddalcu/Kokoro-82M-MLX-Serve)，以及 [Hunyuan3D-2.1](https://huggingface.co/ddalcu/Hunyuan3D-2.1-MLX-Serve-8bit)。点开一个面板，按 **Download**，生成。把文件拖到任何面板上，它会落到正确的槽位，参考图列表也包括在内。每个面板都会在会话之间记住你上次用的模型、质量、分辨率、步数和 seed。
 
 面板还会列出你自己添加的检查点：你的模型文件夹里，凡是系列能被服务器运行的，都会带着该系列对应的控件出现在 **On This Mac** 下，而模型浏览器会提供这些系列的社区包，在 Download 按钮出现之前会先做布局检查。
 
@@ -39,6 +39,7 @@
 - **会说话的角色** —— 在视频提示词里用引号写出台词、附上一段真实的语音或音乐片段，或者为 Qwen3-TTS 输入一句台词让它配音 —— 视频会*围绕*这条音轨生成，表演与之同步，原始音频（不是重新合成）会进入 mp4。
 - **用几秒音频克隆音色** —— 在设置 ▸ 语音中录制或挑选一段片段，Qwen3-TTS 就用那个音色说话 —— 在 AudioGen 面板里、在免手操作语音模式里，处处如此。
 - **谱写完整的音乐曲目** —— ACE-Step 1.5 把一段风格提示词（以及可选歌词）变成 48 kHz 立体声曲目：一首 30 秒的歌约 4 秒渲染完成。
+- **按描述渲染声音** —— Stable Audio 3 Medium 把白话描述变成 44.1 kHz 的声音、氛围和器乐音乐。没有歌词或速度字段：一切信息都写进风格提示词。
 - **把照片变成 3D 模型** —— Hunyuan3D-2.1 把一张图像转换成水密的 GLB 网格，可选带完整 PBR 纹理 —— 直接放进游戏引擎或切片软件。
 - **自带音轨的视频** —— MiniMax-H3（Hailuo 3.0）在一趟里同时对片段和立体声音轨去噪，因此声音是与视频一起生成的，而不是事后配音。先描述场景，再在 `overall_soundscape:` 后面写你想听到的声音。REF2VA 版本围绕你附上的图片、片段或音频构建片段（提示词中的 `<Picture 1>`、`<Video 1>`、`<Audio 1>`）；FL2VA 版本接受首 / 尾关键帧，并把多个窗口串成更长的片段。**Turbo** 用 4 步而不是 30 步渲染。两种方式都慢：1344×768、124 帧在 M4 Max 上约 50 分钟。
 - **风格 LoRA** —— 在运行时挂载 diffusers、kohya 或 PEFT 的 `.safetensors` 适配器，为 FLUX、Krea、Mage-Flow、LTX 或 MiniMax-H3 的生成换风格。一次最多 8 个，相加而不是合并，因此不会有任何东西被重新量化，基础权重零质量损失。每个适配器按它自己文件里声明的强度运行。
@@ -50,14 +51,14 @@
 | 图像 | FLUX.2-klein 4B 4-bit（mflux，预量化约 5 GB） | FLUX.2-klein 9B（10 GB）、Krea-2-Turbo、Mage-Flow Turbo / Edit 8-bit（8.5 / 9.1 GB） | 8 / 12 / 16 GB |
 | 视频 | LTX-Video 2.5 4-bit（36 GB，自带文本编码器） | LTX-Video 2.5 8-bit（59 GB，更锐利 + 扩散解码器）、LTX-Video 2.3 Q4（约 50 GB）、MiniMax-H3（Hailuo 3.0）4-bit / 8-bit，一趟同时生成视频**和**匹配的音轨 | LTX 24 GB RAM；H3 26 GB（40 GB）或 44 GB（69 GB） |
 | 语音 | Qwen3-TTS 1.7b（语音克隆） | Qwen3-TTS 0.6b、Kokoro-82M（54 种音色，约 345 MB） | 8 GB RAM，首次运行约 3.5 GB 下载 |
-| 音乐 | ACE-Step 1.5 XL Turbo 8-bit（快，8 步） | MiniMax Music 3 8-bit（演唱你的歌词，歌曲最长 6 min，人声最强） | ACE 8 GB RAM，约 6.2 GB 下载；Music 3 约 20 GB RAM，13.6 GB 下载 |
+| 音乐 | ACE-Step 1.5 XL Turbo 8-bit（快，8 步） | MiniMax Music 3 8-bit（演唱你的歌词，歌曲最长 6 min，人声最强）、Stable Audio 3 Medium 8-bit（文生音频：声音与音乐，本地转换） | ACE 8 GB RAM，约 6.2 GB 下载；Music 3 约 20 GB RAM，13.6 GB 下载；Stable Audio 3 约 6 GB RAM |
 | 3D | Hunyuan3D-2.1 8-bit（形状 + PBR 纹理） | — | 16 GB RAM |
 
 > 41 GB 的 LTX 2.3 快照**同时**带有两种 transformer 变体（1 阶段蒸馏版 + 2 阶段 dev 版，每个约 11 GB）外加一个 7.6 GB 的蒸馏 LoRA，因此你可以在 Fast/Good/Quality/Super 之间离线切换，无需重新下载。
 
 > LTX-Video 2.5 自带文本编码器，所以首次使用时没有额外的 8 GB 下载。8-bit 包保住了 4-bit 包丢掉的细节，并新增一个 **Diffusion decoder** 开关（Lightricks 自家发布的片段所用、通过 API 指定 `"decoder": "diffusion"` 的那个解码器），让纹理和边缘更锐利。默认画布和帧阶梯按 Mac 定制；两阶段档位按所选尺寸的一半去噪再放大。
 
-> MiniMax Music 3 需要歌词；`[verse]` 和 `[chorus]` 这类结构标签各占一行。ACE-Step 的速度、调性、拍号和语言控件在它上面不存在，所以把这些信息写进描述文本里。当你向聊天要一首歌时，内置的 **music3** 技能会按该模型训练时所用的描述格式来写。
+> MiniMax Music 3 需要歌词；`[verse]` 和 `[chorus]` 这类结构标签各占一行。ACE-Step 的速度、调性、拍号和语言控件在它上面不存在，所以把这些信息写进描述文本里。Stable Audio 3 完全不接受歌词或速度字段 —— 服务器会按名字拒绝，所有信息都装进风格提示词。当你向聊天要一首歌时，内置的 **music3** 技能会按该模型训练时所用的描述格式来写。
 
 输出进入 `~/.mlx-serve/generations/`，按模态、按日期分文件夹。
 

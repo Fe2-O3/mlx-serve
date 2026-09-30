@@ -123,7 +123,7 @@ One server, five modalities. In the app they are tray panels (click, download, g
 | Image | FLUX.2-klein 4B 4-bit (mflux, ~5 GB pre-quantized) | FLUX.2-klein 9B (10 GB), Krea-2-Turbo, Mage-Flow Turbo / Edit 8-bit (8.5 / 9.1 GB) | 8 / 12 / 16 GB |
 | Video | LTX-Video 2.5 4-bit (36 GB, bundled text encoder) | LTX-Video 2.5 8-bit (59 GB, sharper + diffusion decoder), LTX-Video 2.3, MiniMax-H3 (Hailuo 3.0) 4-bit / 8-bit, video **and** matching soundtrack in one pass | LTX 24 GB RAM; H3 26 GB (40 GB) or 44 GB (69 GB) |
 | Speech | Qwen3-TTS 1.7b (voice cloning) | Qwen3-TTS 0.6b, Kokoro-82M (54 voices, ~345 MB) | 8 GB RAM, ~3.5 GB first-run download |
-| Music | ACE-Step 1.5 XL Turbo 8-bit (fast, 8 steps) | MiniMax Music 3 8-bit (sings your lyrics, songs up to 6 min) | ACE 8 GB RAM, ~6.2 GB download; Music 3 ~20 GB RAM, 13.6 GB download |
+| Music | ACE-Step 1.5 XL Turbo 8-bit (fast, 8 steps) | MiniMax Music 3 8-bit (sings your lyrics, songs up to 6 min), Stable Audio 3 Medium 8-bit (text-to-audio sounds and music, convert locally) | ACE 8 GB RAM, ~6.2 GB download; Music 3 ~20 GB RAM, 13.6 GB download; Stable Audio 3 ~6 GB RAM |
 | 3D | Hunyuan3D-2.1 8-bit (shape + PBR texture) | — | 16 GB RAM |
 
 It goes well beyond text-to-X: photo editing by instruction, image-to-image, animating your photos, talking characters synced to real audio, voice cloning from seconds of audio, full music tracks, photo-to-GLB 3D models, and stacked style LoRAs. The full tour is in [docs/app.md](docs/app.md).
