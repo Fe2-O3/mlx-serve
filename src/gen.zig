@@ -3001,6 +3001,15 @@ fn handleMusicSa3(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, s
     defer allocator.free(prompt);
     if (prompt.len == 0) return sendError(conn, 400, "empty 'prompt'");
 
+    // stage 2: CFG scale + negative prompt + APG (see sa3GuidanceFromJson)
+    const g = sa3GuidanceFromJson(body);
+    if (g.err) |m| return sendError(conn, 400, m);
+    var negative: ?[]u8 = null;
+    defer if (negative) |n| {
+        allocator.free(n);
+    };
+    if (g.neg_raw) |raw| negative = try jsonUnescape(allocator, raw);
+
     const duration: u32 = @intCast(extractJsonInt(body, "duration_seconds") orelse 30);
     if (duration < stable_audio3.MIN_DURATION_S or duration > stable_audio3.MAX_DURATION_S)
         return sendError(conn, 400, "'duration_seconds' must be in [1,384]");
@@ -3009,7 +3018,7 @@ fn handleMusicSa3(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, s
     const seed: u64 = extractJsonInt(body, "seed") orelse 42;
 
     const want_stream = sse.bodyWantsTrue(body, "stream");
-    log.info("[sa3] generating {d}s steps={d} seed={d} stream={}\n", .{ duration, steps, seed, want_stream });
+    log.info("[sa3] generating {d}s steps={d} seed={d} cfg={d} stream={}\n", .{ duration, steps, seed, g.cfg_scale, want_stream });
     var sctx = sse.StreamCtx{ .conn = conn, .stream = want_stream };
     const prog: ?sse.Progress = sctx.progress();
     if (want_stream) try conn.writeAll(sse.headers);
@@ -3019,6 +3028,9 @@ fn handleMusicSa3(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, s
         .seconds = @floatFromInt(duration),
         .steps = steps,
         .seed = seed,
+        .cfg_scale = g.cfg_scale,
+        .negative_prompt = negative,
+        .apg = g.apg,
     };
     const wav = sa.generateWav(allocator, req, prog) catch |err| {
         if (err == error.Cancelled) {
@@ -3048,6 +3060,63 @@ fn handleMusicSa3(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, s
         return;
     }
     return sendBytes(conn, allocator, "audio/wav", wav);
+}
+
+/// Parsed Stable Audio 3 guidance fields (stage 2). `err` non-null → HTTP
+/// 400 message (static); `neg_raw` is the raw JSON string slice borrowed
+/// from `body` — the caller unescapes it.
+const Sa3Guidance = struct {
+    cfg_scale: f32 = 1.0,
+    apg: f32 = 1.0,
+    neg_raw: ?[]const u8 = null,
+    err: ?[]const u8 = null,
+};
+
+/// Guidance fields of an SA3 music body (reference sa3_mlx.py): `cfg_scale`
+/// is any finite number with 1.0 = off (the reference default); `apg` lives
+/// in [0,1]; a non-empty `negative_prompt` REQUIRES `cfg_scale != 1.0` —
+/// guidance off means no uncond branch exists, so those words would steer
+/// nothing (refuse, never ignore). Type mismatches fail loud rather than
+/// falling back to defaults, same contract as the nine refusal fields above.
+fn sa3GuidanceFromJson(body: []const u8) Sa3Guidance {
+    var g: Sa3Guidance = .{};
+    if (jsonHasKey(body, "cfg_scale")) {
+        const v = extractJsonFloat(body, "cfg_scale") orelse {
+            g.err = "'cfg_scale' must be a number (1.0 = guidance off)";
+            return g;
+        };
+        const f: f32 = @floatCast(v);
+        if (!std.math.isFinite(f)) {
+            g.err = "'cfg_scale' must be a finite number";
+            return g;
+        }
+        g.cfg_scale = f;
+    }
+    if (jsonHasKey(body, "apg")) {
+        const v = extractJsonFloat(body, "apg") orelse {
+            g.err = "'apg' must be a number in [0,1]";
+            return g;
+        };
+        if (v < 0.0 or v > 1.0) {
+            g.err = "'apg' must be in [0,1] (0 = vanilla CFG, 1 = full APG)";
+            return g;
+        }
+        g.apg = @floatCast(v);
+    }
+    if (jsonHasKey(body, "negative_prompt")) {
+        const raw = extractJsonString(body, "negative_prompt") orelse {
+            g.err = "'negative_prompt' must be a string";
+            return g;
+        };
+        if (raw.len > 0) {
+            if (g.cfg_scale == 1.0) {
+                g.err = "'negative_prompt' needs an uncond branch: set 'cfg_scale' to a value other than 1.0 (e.g. 3.0)";
+                return g;
+            }
+            g.neg_raw = raw;
+        }
+    }
+    return g;
 }
 
 /// POST /v1/video/generations — base64 RGB8 frames (or SSE progress + complete).
@@ -6209,6 +6278,55 @@ test "instrumental is parsed off the body only when spelled true" {
     try testing.expect(sse.bodyWantsTrue("{\"instrumental\": true}", "instrumental"));
     try testing.expect(!sse.bodyWantsTrue("{\"instrumental\":false}", "instrumental"));
     try testing.expect(!sse.bodyWantsTrue("{\"prompt\":\"x\"}", "instrumental"));
+}
+
+test "sa3GuidanceFromJson: cfg/apg/negative_prompt parse, range, and pairing rules" {
+    // Defaults: guidance off (reference default), full APG, no negative.
+    const d = sa3GuidanceFromJson("{\"prompt\":\"jazz\"}");
+    try testing.expect(d.err == null);
+    try testing.expectEqual(@as(f32, 1.0), d.cfg_scale);
+    try testing.expectEqual(@as(f32, 1.0), d.apg);
+    try testing.expect(d.neg_raw == null);
+
+    // cfg_scale parses; anything non-numeric fails LOUD (never a silent default).
+    const c = sa3GuidanceFromJson("{\"prompt\":\"jazz\",\"cfg_scale\":3.5}");
+    try testing.expect(c.err == null);
+    try testing.expectEqual(@as(f32, 3.5), c.cfg_scale);
+    const cbad = sa3GuidanceFromJson("{\"prompt\":\"jazz\",\"cfg_scale\":\"high\"}");
+    try testing.expect(cbad.err != null);
+    try testing.expect(std.mem.indexOf(u8, cbad.err.?, "cfg_scale") != null);
+
+    // apg is [0,1] — out of range names itself.
+    const aok = sa3GuidanceFromJson("{\"prompt\":\"jazz\",\"cfg_scale\":3,\"apg\":0.2}");
+    try testing.expect(aok.err == null);
+    try testing.expectEqual(@as(f32, 0.2), aok.apg);
+    const ahi = sa3GuidanceFromJson("{\"prompt\":\"jazz\",\"cfg_scale\":3,\"apg\":1.5}");
+    try testing.expect(ahi.err != null);
+    try testing.expect(std.mem.indexOf(u8, ahi.err.?, "apg") != null);
+    const alo = sa3GuidanceFromJson("{\"prompt\":\"jazz\",\"cfg_scale\":3,\"apg\":-0.1}");
+    try testing.expect(alo.err != null);
+
+    // negative_prompt WITHOUT guidance would silently steer nothing — refuse
+    // and point at cfg_scale instead of dropping the user's words.
+    const npair = sa3GuidanceFromJson("{\"prompt\":\"jazz\",\"negative_prompt\":\"no drums\"}");
+    try testing.expect(npair.err != null);
+    try testing.expect(std.mem.indexOf(u8, npair.err.?, "cfg_scale") != null);
+    const ok = sa3GuidanceFromJson("{\"prompt\":\"jazz\",\"cfg_scale\":3,\"negative_prompt\":\"no drums\"}");
+    try testing.expect(ok.err == null);
+    try testing.expectEqualStrings("no drums", ok.neg_raw.?);
+
+    // Empty negative is absent (upstream treats "" as no negative prompt) —
+    // no pairing error either, there is nothing to condition on.
+    const nempty = sa3GuidanceFromJson("{\"prompt\":\"jazz\",\"cfg_scale\":3,\"negative_prompt\":\"\"}");
+    try testing.expect(nempty.err == null);
+    try testing.expect(nempty.neg_raw == null);
+    const nempty2 = sa3GuidanceFromJson("{\"prompt\":\"jazz\",\"negative_prompt\":\"\"}");
+    try testing.expect(nempty2.err == null);
+    try testing.expect(nempty2.neg_raw == null);
+
+    // A non-string negative fails loud too.
+    const nbad = sa3GuidanceFromJson("{\"prompt\":\"jazz\",\"cfg_scale\":3,\"negative_prompt\":42}");
+    try testing.expect(nbad.err != null);
 }
 
 test "videoRgbTransportReason: chained windows are billed into the response cap (#283)" {
