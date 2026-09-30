@@ -1385,14 +1385,16 @@ struct Model3DModelPreset: Identifiable, Hashable {
     static let all: [Model3DModelPreset] = [.hunyuan3d21_8bit]
 }
 
-/// Which music ENGINE a checkpoint drives. The two families share the
-/// endpoint and nothing else: ACE-Step reads the whole musical-metadata knob
-/// set, MiniMax Music 3 rejects every one of those fields BY NAME and
-/// requires lyrics — so the family gates the FIELDS (request body + sidecar),
-/// not just the pane's controls.
+/// Which music ENGINE a checkpoint drives. The families share the endpoint
+/// and nothing else: ACE-Step reads the whole musical-metadata knob set,
+/// MiniMax Music 3 rejects every one of those fields BY NAME and requires
+/// lyrics, Stable Audio 3 refuses ALL of them (pure text-to-audio — every
+/// knob travels inside `prompt`) — so the family gates the FIELDS (request
+/// body + sidecar), not just the pane's controls.
 enum MusicEngineFamily {
     case acestep
     case minimaxMusic3
+    case stableAudio3
 }
 
 /// Music-generation checkpoints (ACE-Step + MiniMax Music 3, the music arms
@@ -1431,27 +1433,33 @@ struct MusicModelPreset: Identifiable, Hashable {
     /// on Music 3 and the pane hides them there.
     var supportsMusicalMeta: Bool { family == .acestep }
 
-    /// Tempo and key, which BOTH engines support — they are conditioning
-    /// fields on ACE-Step and caption text on Music 3 (Global Metadata on
-    /// MiniMax's card; its example caption reads "BPM: 96. Key: C major."").
-    /// The pane used to hide them on Music 3 along with the two genuinely
-    /// unsupported knobs, which read as "this model can't do tempo".
-    var supportsTempoAndKey: Bool { true }
+    /// Tempo and key: conditioning fields on ACE-Step, caption text on Music
+    /// 3 (Global Metadata on MiniMax's card; its own example caption reads
+    /// "BPM: 96. Key: C major."). Stable Audio 3 has no equivalent — the
+    /// server names each field a 400, so the FIELDS are gated too (sticky
+    /// values survive a model switch).
+    var supportsTempoAndKey: Bool { family != .stableAudio3 }
     /// Music 3 is lyric-conditioned; the server 400s empty lyrics. ACE-Step
     /// defaults empty lyrics to "[Instrumental]".
     var requiresLyrics: Bool { family == .minimaxMusic3 }
-    /// Server-valid duration bounds (ACE [10,600]; Music 3 [1,360], floored
-    /// at 5 for a usable slider).
+    /// Server-valid duration bounds (ACE [10,600]; Music 3 [1,360]; Stable
+    /// Audio 3 [1,384] — all floored at 5 for a usable slider except ACE's).
     var durationRange: ClosedRange<Double> {
-        family == .acestep ? 10...600 : 5...360
+        switch family {
+        case .acestep: return 10...600
+        case .minimaxMusic3: return 5...360
+        case .stableAudio3: return 5...384
+        }
     }
 
-    /// Music 3 takes `steps` in [4,100] — the flow-match refinement passes.
+    /// `steps` is user-editable on Music 3 ([4,100], the flow-match
+    /// refinement passes) and Stable Audio 3 ([1,100], the ping-pong
+    /// schedule — 1 is a legal single forward pass, reference default 8).
     /// ACE-Step Turbo is distillation-fixed at 8 and the server IGNORES the
     /// field there, so exposing it would be a control that visibly does
     /// nothing. `fixedSteps` stays the per-checkpoint default either way.
-    var supportsSteps: Bool { family == .minimaxMusic3 }
-    var stepsRange: ClosedRange<Int> { 4...100 }
+    var supportsSteps: Bool { family == .minimaxMusic3 || family == .stableAudio3 }
+    var stepsRange: ClosedRange<Int> { family == .stableAudio3 ? 1...100 : 4...100 }
     /// Reference audio (server `ref_audio`, #259): ACE-Step feeds a 30 s
     /// window of the clip's VAE latent into its timbre slot — ONE pooled
     /// token among hundreds of lyric/text tokens, so it is style/timbre
@@ -1494,8 +1502,25 @@ struct MusicModelPreset: Identifiable, Hashable {
         description: "MiniMax's full-song model: an 8B language model writes the music frame by frame from your style prompt and lyrics, then a diffusion decoder renders it. Slower than ACE-Step, strongest vocals."
     )
 
+    /// Stable Audio 3 Medium, 8-bit — differential-attention DiT (1536w, 24
+    /// blocks) + T5Gemma text encoder + SAME-L decoder at 44.1 kHz. Pure
+    /// text-to-audio: no lyrics path, no tempo/key fields — every knob is
+    /// prompt text. No published mlx-serve repo yet, so weights are converted
+    /// on-device with `tests/convert_stable_audio3_weights.py`.
+    static let stableAudio3Medium = MusicModelPreset(
+        id: "stable-audio-3-medium-8bit",
+        name: "Stable Audio 3 Medium (8-bit)",
+        repo: "local/stable-audio-3-medium",
+        family: .stableAudio3,
+        approxRAMGB: 6,
+        approxDownloadGB: 5.5,
+        fixedSteps: 8,
+        supportsLyrics: false,
+        description: "Stability's text-to-audio model: describes sounds, ambience and instrumental music in words and renders them at 44.1 kHz in 8 ping-pong steps. No lyrics or tempo fields — put everything in the style prompt."
+    )
+
     /// Catalog, best-first per family.
-    static let all: [MusicModelPreset] = [.acestepXLTurbo8bit, .miniMaxMusic3_8bit]
+    static let all: [MusicModelPreset] = [.acestepXLTurbo8bit, .miniMaxMusic3_8bit, .stableAudio3Medium]
 }
 
 extension MusicGenRequest {

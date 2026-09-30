@@ -50,8 +50,10 @@ enum AgentPrompt {
         var note = "\n\n# Music engine\nThe Music window is set to “\(model.name)”, so that is what `generate_music` runs. "
         if model.requiresLyrics {
             note += "It requires `lyrics` — a call without them fails. Write original words with section tags ([verse], [chorus]) on their own lines; for an instrumental send the tags with no words under them. "
-        } else {
+        } else if model.supportsLyrics {
             note += "`lyrics` are optional — omit them for an instrumental. "
+        } else {
+            note += "It takes NEITHER `lyrics` nor `instrumental` — the server 400s both. It is text-to-audio: describe everything, singing included, in `prompt`. "
         }
         if model.supportsMusicalMeta {
             note += "It reads `bpm`, `keyscale`, `time_signature` and `vocal_language`; set them when the user names a tempo, key or language."

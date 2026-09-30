@@ -89,7 +89,8 @@ private let mediaModelTypePrefixes: [String] = ["flux2", "krea", "mage_flow", "q
 // asserts this agrees. Zig already pinned its own two copies against each
 // other; nothing pinned Swift, which is why this drifted unnoticed.
 private let mediaModelTypeExactValues: Set<String> = [
-    "qwen3_tts", "AudioVideo", "acestep", "minimax_h3", "minimax_music3", "kokoro", "mageflow", "laya",
+    "qwen3_tts", "AudioVideo", "acestep", "minimax_h3", "minimax_music3", "stable_audio3", "kokoro", "mageflow",
+    "laya",
 ]
 
 func isMediaModelType(_ modelType: String) -> Bool {
@@ -130,7 +131,7 @@ enum MediaModality: CaseIterable {
         if modelType.hasPrefix("hunyuan3d") { self = .mesh; return }
         switch modelType {
         case "qwen3_tts", "kokoro": self = .voice
-        case "acestep", "minimax_music3": self = .music
+        case "acestep", "minimax_music3", "stable_audio3": self = .music
         case "AudioVideo", "minimax_h3": self = .video
         default: return nil
         }

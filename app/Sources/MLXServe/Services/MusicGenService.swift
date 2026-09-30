@@ -44,15 +44,19 @@ final class MusicGenService: ObservableObject {
             "duration_seconds": duration,
             "stream": true,
         ]
-        // `instrumental` and lyrics are a named 400 on BOTH backends, so the
-        // flag WINS here rather than letting the pair reach the server. On
-        // Music 3 an omitted lyrics field is the only spelling of "no words"
-        // that is accepted at all.
-        if request.instrumental {
-            body["instrumental"] = true
-        } else {
-            let lyrics = request.lyrics.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !lyrics.isEmpty { body["lyrics"] = lyrics }
+        // `instrumental` and lyrics: on the lyric-capable engines the flag
+        // WINS rather than letting the pair reach the server (both name the
+        // pair a 400), and on Music 3 an omitted lyrics field is the only
+        // spelling of "no words" that is accepted at all. Stable Audio 3 has
+        // no lyric path AT ALL — the server 400s both fields — so neither may
+        // travel there however sticky settings are set.
+        if request.model.supportsLyrics {
+            if request.instrumental {
+                body["instrumental"] = true
+            } else {
+                let lyrics = request.lyrics.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !lyrics.isEmpty { body["lyrics"] = lyrics }
+            }
         }
         // Only the backend that reads `steps` gets it — ACE-Step Turbo ignores
         // the field. Clamping mirrors the duration clamp above: sticky settings
@@ -112,14 +116,21 @@ final class MusicGenService: ObservableObject {
     /// a track is reproducible/documented. `resolvedSeed` is the concrete seed
     /// actually used (never -1). Omits fields the request left to the model.
     nonisolated static func settingsText(_ request: MusicGenRequest, resolvedSeed: Int, modelName: String) -> String {
+        // The body clamps duration into THIS model's range (sticky settings
+        // outlive a model switch), so the sidecar records the clamped value —
+        // a sidecar claiming a duration the server never received would make
+        // the track irreproducible.
+        let range = request.model.durationRange
+        let clampedDuration = Int(min(max(Double(request.durationSeconds), range.lowerBound), range.upperBound))
         var lines: [String] = [
             "model: \(modelName)",
-            "duration_seconds: \(request.durationSeconds)",
+            "duration_seconds: \(clampedDuration)",
             "seed: \(resolvedSeed)",
         ]
         // A setting that changed the output but not the sidecar is a silent
-        // setting — the .txt is what makes a track reproducible.
-        if request.instrumental { lines.append("instrumental: true") }
+        // setting — the .txt is what makes a track reproducible. Gated like
+        // the body: an omitted field must not be recorded as sent.
+        if request.model.supportsLyrics, request.instrumental { lines.append("instrumental: true") }
         if request.model.supportsSteps, let steps = request.steps {
             let r = request.model.stepsRange
             lines.append("steps: \(min(max(steps, r.lowerBound), r.upperBound))")
@@ -150,8 +161,12 @@ final class MusicGenService: ObservableObject {
         }
         var out = lines.joined(separator: "\n")
         out += "\n\n# Style prompt\n" + request.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        let lyr = request.lyrics.trimmingCharacters(in: .whitespacesAndNewlines)
-        out += "\n\n# Lyrics\n" + (request.instrumental || lyr.isEmpty ? "[Instrumental]" : lyr)
+        // Gated like the body: a model that never receives lyrics gets no
+        // Lyrics block in the record either.
+        if request.model.supportsLyrics {
+            let lyr = request.lyrics.trimmingCharacters(in: .whitespacesAndNewlines)
+            out += "\n\n# Lyrics\n" + (request.instrumental || lyr.isEmpty ? "[Instrumental]" : lyr)
+        }
         return out + "\n"
     }
 

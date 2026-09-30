@@ -17,14 +17,65 @@ final class MusicGenTests: XCTestCase {
             XCTAssertFalse(p.repo.isEmpty)
             XCTAssertGreaterThan(p.approxRAMGB, 0)
             // Steps are checkpoint facts: ACE Turbo is distillation-fixed at
-            // 8; Music 3 runs the reference 30-step flow-match schedule.
-            XCTAssertEqual(p.fixedSteps, p.family == .acestep ? 8 : 30)
+            // 8; Music 3 runs the reference 30-step flow-match schedule;
+            // Stable Audio 3 the reference ping-pong default of 8.
+            switch p.family {
+            case .acestep: XCTAssertEqual(p.fixedSteps, 8, p.id)
+            case .minimaxMusic3: XCTAssertEqual(p.fixedSteps, 30, p.id)
+            case .stableAudio3: XCTAssertEqual(p.fixedSteps, 8, p.id)
+            }
         }
         // Published converted repo → the pane offers a one-click download
         // (a `local/` prefix would show the convert-locally hint instead).
         XCTAssertFalse(MusicModelPreset.acestepXLTurbo8bit.isLocalOnly)
         XCTAssertEqual(MusicModelPreset.acestepXLTurbo8bit.repo,
                        "ddalcu/ACE-Step-1.5-XL-Turbo-MLX-Serve-8bit")
+    }
+
+    /// Stable Audio 3 is the third engine: pure text-to-audio. The server
+    /// names EVERY field the other two condition on a 400, so the preset's
+    /// flags must gate the pane AND the wire — a value lingering in sticky
+    /// settings across a model switch must not reach a server that refuses
+    /// it, and must not be claimed in the sidecar either.
+    func testStableAudio3IsTextToAudioAndGatesEveryOtherEngineField() {
+        let p = MusicModelPreset.stableAudio3Medium
+        XCTAssertEqual(p.family, .stableAudio3)
+        XCTAssertTrue(MusicModelPreset.all.contains(p), "in the picker catalog")
+        XCTAssertFalse(p.supportsLyrics, "no lyric conditioning")
+        XCTAssertFalse(p.requiresLyrics, "never demands lyrics")
+        XCTAssertFalse(p.supportsMusicalMeta, "vocal_language/timesignature are named 400s")
+        XCTAssertFalse(p.supportsTempoAndKey, "bpm/keyscale are named 400s")
+        XCTAssertFalse(p.supportsReferenceAudio, "ref_audio is a named 400")
+        XCTAssertFalse(p.supportsSourceAudio, "task/src_audio are named 400s")
+        XCTAssertTrue(p.supportsSteps, "steps are user-editable")
+        XCTAssertEqual(p.stepsRange, 1...100, "server range [1,100], reference default 1 forward pass")
+        XCTAssertEqual(p.durationRange, 5...384, "server range [1,384], floored at 5 for a usable slider")
+        XCTAssertEqual(p.fixedSteps, 8, "the reference ping-pong default")
+    }
+
+    func testStableAudio3RequestBodySendsOnlyWhatTheServerReads() {
+        let req = MusicGenRequest(model: .stableAudio3Medium, prompt: "rain on a tin roof",
+                                  lyrics: "[Verse]\nla la la", instrumental: true,
+                                  vocalLanguage: "ja", bpm: 96, keyscale: "C major",
+                                  timesignature: "4/4", durationSeconds: 600,
+                                  seed: 7, steps: 50, refAudioPath: "/tmp/ref.wav")
+        let body = MusicGenService.requestBody(req, modelName: "sa3", refAudioB64: "UklGRg==")
+        XCTAssertNil(body["instrumental"], "SA3 has no instrumental path — the server 400s the field")
+        XCTAssertNil(body["lyrics"])
+        XCTAssertNil(body["bpm"])
+        XCTAssertNil(body["keyscale"])
+        XCTAssertNil(body["vocal_language"])
+        XCTAssertNil(body["timesignature"])
+        XCTAssertNil(body["ref_audio"])
+        XCTAssertEqual(body["duration_seconds"] as? Int, 384, "sticky 600 clamps into the server range")
+        XCTAssertEqual(body["steps"] as? Int, 50)
+        XCTAssertEqual(body["seed"] as? Int, 7, "resolved seed rides the body for reproducibility")
+        // The sidecar is the reproducibility record: it may claim only what
+        // the body actually carried.
+        let txt = MusicGenService.settingsText(req, resolvedSeed: 7, modelName: "sa3")
+        XCTAssertFalse(txt.contains("instrumental"), "an omitted field must not be recorded as sent")
+        XCTAssertFalse(txt.contains("# Lyrics"), "lyrics never travel to this engine")
+        XCTAssertTrue(txt.contains("duration_seconds: 384"), "records the clamped value actually sent")
     }
 
     func testReferenceAudioIsDeclaredPerFamilyAndSentOnlyThere() {

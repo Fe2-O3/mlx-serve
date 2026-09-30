@@ -436,6 +436,32 @@ extension MediaBundle {
         )
     }
 
+    /// Stable Audio 3: a flat converted dir — config.json + tokenizer.json +
+    /// T5Gemma + DiT + SAME-L decoder/encoder safetensors. dit.safetensors is
+    /// the completeness marker (written LAST by the converter — mirrors the
+    /// server's `requiredMediaMarker`).
+    static func stableAudio3(repo: String, displayName: String, sizeGB: Double) -> MediaBundle {
+        MediaBundle(
+            id: "stable_audio3:\(repo)",
+            displayName: displayName,
+            components: [
+                MediaComponent(
+                    repo: repo,
+                    selection: FileSelection(recursive: true, keepSafetensors: [
+                        "t5gemma.safetensors", "dit.safetensors",
+                        "same_l_decoder.safetensors", "same_l_encoder_f32.safetensors",
+                    ]),
+                    readyMarkers: [
+                        "config.json", "tokenizer.json", "t5gemma.safetensors",
+                        "dit.safetensors", "same_l_decoder.safetensors",
+                        "same_l_encoder_f32.safetensors",
+                    ]
+                ),
+            ],
+            sizeEstimateGB: sizeGB
+        )
+    }
+
     /// Mage-Flow (diffusers layout): one repo with weight subdirs
     /// (`transformer/`, `vae/`, `text_encoder/`, `scheduler/`) and NO root
     /// config.json — detection keys on `model_index.json`. Recursive download
@@ -546,6 +572,7 @@ extension MusicModelPreset {
         switch family {
         case .acestep: return .music(repo: repo, displayName: name, sizeGB: approxDownloadGB)
         case .minimaxMusic3: return .music3(repo: repo, displayName: name, sizeGB: approxDownloadGB)
+        case .stableAudio3: return .stableAudio3(repo: repo, displayName: name, sizeGB: approxDownloadGB)
         }
     }
 }

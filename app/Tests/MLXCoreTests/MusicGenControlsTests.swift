@@ -267,6 +267,21 @@ final class MusicTempoKeyTests: XCTestCase {
         XCTAssertEqual(aceBody["timesignature"] as? String, "3")
     }
 
+    func testStableAudio3TakesNeitherTempoNorKey() {
+        // The server names `bpm`/`keyscale` 400s on Stable Audio 3 — so the
+        // FIELDS are gated, not just the pane's controls (sticky values
+        // survive a model switch, and the sidecar must not claim them).
+        let sa3 = MusicModelPreset.stableAudio3Medium
+        XCTAssertFalse(sa3.supportsTempoAndKey)
+        let req = MusicGenRequest(model: sa3, prompt: "ambient rain", bpm: 96,
+                                  keyscale: "C major", durationSeconds: 30)
+        let body = MusicGenService.requestBody(req, modelName: "m")
+        XCTAssertNil(body["bpm"])
+        XCTAssertNil(body["keyscale"])
+        let txt = MusicGenService.settingsText(req, resolvedSeed: 1, modelName: "m")
+        XCTAssertFalse(txt.contains("bpm:"), "sidecar records only what was sent")
+    }
+
     func testTheSidecarRecordsTempoAndKeyOnBothEngines() {
         for preset in [MusicModelPreset.acestepXLTurbo8bit, .miniMaxMusic3_8bit] {
             let req = MusicGenRequest(model: preset, prompt: "pop", lyrics: "la",

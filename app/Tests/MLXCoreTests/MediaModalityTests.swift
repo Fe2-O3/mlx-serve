@@ -67,7 +67,7 @@ final class MediaModalityParityTests: XCTestCase {
         // architecture gate entirely. It must stay excluded for the right
         // reason — `useModelAndAwaitReady` would push a diffusion checkpoint
         // through the text loader.
-        for t in ["minimax_music3", "kokoro", "acestep", "flux2-klein-4b", "qwen3_tts"] {
+        for t in ["minimax_music3", "stable_audio3", "kokoro", "acestep", "flux2-klein-4b", "qwen3_tts"] {
             let m = LocalModel(id: "test:\(t)", name: t, path: "/tmp/\(t)",
                                sizeFormatted: "1 GB", modelType: t, source: .mlxServe, kind: .base)
             XCTAssertFalse(m.isChatPickable, "\(t) must not be chat-pickable")
@@ -86,7 +86,7 @@ final class MediaModalityRoutingTests: XCTestCase {
             ("flux2-klein-4b", .image), ("krea2_turbo", .image),
             ("mage_flow", .image), ("mageflow", .image),
             ("qwen3_tts", .voice), ("kokoro", .voice),
-            ("acestep", .music), ("minimax_music3", .music),
+            ("acestep", .music), ("minimax_music3", .music), ("stable_audio3", .music),
             ("AudioVideo", .video), ("minimax_h3", .video),
             ("hunyuan3d_2_1", .mesh), ("hunyuan3d_2_1_paint", .mesh),
         ]

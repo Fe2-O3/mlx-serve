@@ -67,6 +67,7 @@ enum CustomMediaModels {
         switch arch {
         case "acestep": return .acestepXLTurbo8bit
         case "minimax_music3": return .miniMaxMusic3_8bit
+        case "stable_audio3": return .stableAudio3Medium
         default: return nil
         }
     }

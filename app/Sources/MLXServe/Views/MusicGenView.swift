@@ -144,7 +144,10 @@ struct MusicGenView: View {
                     if model.supportsSourceAudio { modeSection }
                     if sourceTask { sourceSection }
                     promptSection
-                    lyricsSection
+                    // The lyrics well + instrumental switch exist only where
+                    // the engine reads them: Stable Audio 3 names both
+                    // fields a 400, so the whole block stays hidden there.
+                    if model.supportsLyrics { lyricsSection }
                     if model.supportsReferenceAudio { referenceSection }
                     // No Duration in a source task: the clip is the length, and
                     // the Source well already says how long that is.
@@ -689,9 +692,9 @@ struct MusicGenView: View {
 
     private var advancedBody: some View {
         VStack(alignment: .leading, spacing: 10) {
-            // Refinement passes. Music 3 only: ACE-Step Turbo is distillation-
-            // fixed at 8 and the server ignores the field, so a control there
-            // would visibly do nothing.
+            // Refinement passes. Music 3 and Stable Audio 3: ACE-Step Turbo
+            // is distillation-fixed at 8 and the server ignores the field, so
+            // a control there would visibly do nothing.
             if model.supportsSteps {
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 6) {
@@ -1017,10 +1020,10 @@ struct MusicGenView: View {
                     }
                 }
             }
-            // Named after the engine, because the two sets are not
-            // interchangeable: ACE-Step reads a one-line genre description and
-            // Music 3 a structured caption.
-            Section("Example templates for \(model.family == .minimaxMusic3 ? "MiniMax Music 3" : "ACE-Step")") {
+            // Named after the engine, because the sets are not
+            // interchangeable: ACE-Step reads a one-line genre description,
+            // Music 3 a structured caption, Stable Audio 3 plain prose.
+            Section("Example templates for \(model.family == .stableAudio3 ? "Stable Audio 3" : model.family == .minimaxMusic3 ? "MiniMax Music 3" : "ACE-Step")") {
                 ForEach(MusicPrompt.builtinStyles(for: model.family)) { p in
                     Button(L10n.text(p.title)) { prompt = p.body }
                 }
