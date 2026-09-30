@@ -62,6 +62,12 @@ Fixture taps (all under --out, default ~/claude-tmp/sa3/fixtures):
   x0_a2a.f32.raw         [1,256,T]    init*(1-σ) + noise*σ mixed sampler input
   latents_a2a_final.f32.raw [1,256,T] final latent of the audio-to-audio run
   audio_a2a.f32.raw      [1,2,S]      the a2a run decoded (e2e oracle)
+  inpaint_mask.f32.raw   [1,1,T]      1=keep, 0=regenerate (inpaint range)
+  inpaint_local_cond.f32.raw [1,T,257] (mask, masked_input) DiT local cond
+  inpaint_v_t50.f32.raw  [1,256,T]    plain DiT forward with local cond
+  inpaint_cfg_v_t50.f32.raw [1,256,T] … and the batched CFG branch (lac duped)
+  latents_inpaint_final.f32.raw [1,256,T] after paste-back (e2e oracle)
+  audio_inpaint.f32.raw  [1,2,S]      the inpainting run decoded (e2e oracle)
   meta.json              shapes, seeds, dispatch, tokenizer cross-check
 
 Then:  export SA3_TEST_MODEL=<pack> SA3_FIXTURES=<out>  and run the Zig
@@ -124,6 +130,16 @@ A2A_SIGMA_MAX = 0.5
 # makes enc_T_lat == T_lat for every T_lat, so only the sample count moves.
 A2A_PAD_SAMPLES = 500000   # 11.34 s < the 15.05 s target → pad 163552
 A2A_TRIM_SAMPLES = 700000  # 15.87 s > the 15.05 s target → trim 36448
+
+# Stage-4 (inpainting) ground truth: sa3_mlx.py --init-audio + --inpaint-range.
+# inpaint mode SKIPS the init mix (sa3_mlx.py:702 — `init_latents is not None
+# and inpaint_range is None` is false), starts from the same pure x0, and
+# feeds the DiT a [1,T,257] local_add_cond of (mask, masked_input) plus a
+# paste-back of the kept region over the final latent.
+INPAINT_RANGE_SEC = (4.0, 9.0)  # → latents, rounded like sa3_mlx.py:524-528
+# The CFG branch must duplicate local_add_cond across the batch — a tap pins
+# that threading (the plain forward path is pinned by the full run below).
+INPAINT_CFG_TAP = (3.0, 1.0, 0.5)
 
 
 def log(msg):
@@ -255,14 +271,16 @@ def sample_loop(model_fn, x, sigmas, seed):
     return latents, noises
 
 
-def cfg_model_fn(dit, cross, null_cross, global_cond, cfg, apg):
+def cfg_model_fn(dit, cross, null_cross, global_cond, cfg, apg, local=None):
     """sa3_mlx.py's `model_fn` CFG branch (lines ~736-762), verbatim math.
 
     sa3_mlx defines it inline inside main(), so it cannot be imported — the
     body below is a direct copy (names adapted: args.* → locals, cross_attn
     → cross). Batched cond+uncond forward over cat([x, x]); blend happens in
     denoised space (RF: denoised = x - σ·v), with optional APG projection,
-    then converts back to velocity.
+    then converts back to velocity. `local` is the inpainting
+    local_add_cond, duplicated across the batch like the reference does
+    (sa3_mlx.py:723).
     """
 
     def model_fn(x, t):
@@ -270,7 +288,8 @@ def cfg_model_fn(dit, cross, null_cross, global_cond, cfg, apg):
         t2 = mx.concatenate([t, t], axis=0)
         cross2 = mx.concatenate([cross, null_cross], axis=0)
         global2 = mx.concatenate([global_cond, global_cond], axis=0)
-        v_batched = dit(x2, t2, cross2, global2, local_add_cond=None)
+        lac2 = None if local is None else mx.concatenate([local, local], axis=0)
+        v_batched = dit(x2, t2, cross2, global2, local_add_cond=lac2)
         cond_v, uncond_v = mx.split(v_batched, 2, axis=0)
 
         sigma = t.reshape(-1, 1, 1).astype(mx.float32)
@@ -373,7 +392,7 @@ def main(argv=None):
 
     # ── 1. tokenize — SentencePiece proto is ground truth; assert the pack's
     # tokenizer.json agrees, because that is the file Zig reads.
-    log("stage 1/7  tokenize")
+    log("stage 1/8  tokenize")
     with np.load(os.path.join(args.npz, "t5gemma_f16.npz")) as z:
         sp = spm.SentencePieceProcessor()
         sp.LoadFromSerializedProto(z["TOKENIZER_MODEL"].tobytes())
@@ -400,7 +419,7 @@ def main(argv=None):
 
     # ── 2. T5Gemma forward (empty prompt takes the reference's own special
     # path: one visible position during the forward, mask restored after).
-    log("stage 2/7  T5Gemma")
+    log("stage 2/8  T5Gemma")
     t5_npz = prepare_t5gemma_npz(args.pack, args.npz, bits, args.scratch)
     enc = t5g.T5Gemma.from_npz(t5_npz)
     hidden_cond, _ = enc.encode([PROMPT], max_len=256)
@@ -408,7 +427,7 @@ def main(argv=None):
     mx.eval(hidden_cond, hidden_empty)
 
     # ── 3. conditioning: padding + seconds token.
-    log("stage 3/7  conditioning")
+    log("stage 3/8  conditioning")
     dit_npz = prepare_dit_npz(args.pack, bits, args.scratch)
     padding_emb, secs = pipe.load_conditioner_from_npz(dit_npz, prefix="cond.")
     dtype = mx.float16  # sa3_mlx.py --dit-dtype fp16 default
@@ -428,7 +447,7 @@ def main(argv=None):
     mx.eval(cross, global_cond, cross_neg)
 
     # ── 4. DiT velocity probes + sampler inputs.
-    log("stage 4/7  DiT")
+    log("stage 4/8  DiT")
     dit = dit_mod.load_dit(dit_npz, T_lat=T_lat, dtype=dtype, compile_=False)
     key = mx.random.key(seed)
     x0 = mx.random.normal((1, 256, T_lat), dtype=dtype, key=key)
@@ -456,7 +475,7 @@ def main(argv=None):
 
     # ── 5. sampler: 8 ping-pong steps, cross-checked against the reference
     # function (my exposed loop must land exactly where theirs does).
-    log("stage 5/7  sampler")
+    log("stage 5/8  sampler")
     sigmas = pipe.build_pingpong_schedule(steps, sigma_max=1.0, use_logsnr_shift=True)
 
     def model_fn(x, t):
@@ -486,7 +505,7 @@ def main(argv=None):
 
     # ── 6. decode: production arm (chunked when T_lat > kernel 144) plus the
     # two short/odd arms of sa3_mlx.py's dispatch.
-    log("stage 6/7  decode")
+    log("stage 6/8  decode")
     dec_npz = prepare_decoder_npz(args.pack, args.scratch)
     decoder = dec_mod.load_model(weights_path=dec_npz, dtype=mx.float32)
     latents_final = latents[-1].astype(mx.float32)
@@ -530,7 +549,7 @@ def main(argv=None):
 
     # ── 7. audio-to-audio: SAME-L encoder + σmax schedule + init mix + a full
     # run (sa3_mlx.py stage 3a/3b with --init-audio --init-noise-level=0.5).
-    log("stage 7/7  audio-to-audio")
+    log("stage 7/8  audio-to-audio")
     sigmas_a2a = pipe.build_pingpong_schedule(steps, sigma_max=A2A_SIGMA_MAX, use_logsnr_shift=True)
     mx.eval(sigmas_a2a)
 
@@ -640,6 +659,90 @@ def main(argv=None):
         "run": "init=trim PCM, mixed x0, σmax schedule, seed+1 redraw chain, cfg=1",
     }
 
+    # ── 8. inpainting: local_add_cond + paste-back. inpaint mode never mixes
+    # the init into the noise (sa3_mlx.py:702), so the sampler starts from the
+    # SAME pure x0 as text-to-audio — local_add_cond is the only new input.
+    log("stage 8/8  inpainting")
+    inp_s_sec, inp_e_sec = INPAINT_RANGE_SEC
+    inp_s0 = max(0, int(round(inp_s_sec * SAMPLE_RATE / SAMPLES_PER_LATENT)))
+    inp_s1 = min(T_lat, int(round(inp_e_sec * SAMPLE_RATE / SAMPLES_PER_LATENT)))
+    if not (0 <= inp_s0 < inp_s1 <= T_lat):
+        raise SystemExit(f"[FATAL] inpaint range {inp_s0}..{inp_s1} outside T_lat={T_lat}")
+
+    # The SAME encoder output as the a2a run, cast to the run dtype right
+    # after encoding (sa3_mlx.py:688) — inpainting reuses init_latents_trim.
+    init_inpaint = init_trim.astype(dtype)                 # f16
+    mask_np = np.ones((1, 1, T_lat), dtype=np.float32)
+    mask_np[:, :, inp_s0:inp_s1] = 0.0                     # 0 = regenerate
+    inp_mask = mx.array(mask_np)                           # 1 = keep
+    # concat over the channel dim → (1,257,T_lat), then batch-last-channel
+    # transpose and cast to the run dtype (sa3_mlx.py:719-722).
+    masked_input = init_inpaint.astype(mx.float32) * inp_mask
+    local_cond = (mx.concatenate([inp_mask, masked_input], axis=1)
+                    .transpose(0, 2, 1).astype(dtype))
+    mx.eval(local_cond, inp_mask, init_inpaint)
+
+    # σmax stays 1.0 → the plain schedule; x0 is pure noise (no init mix).
+    dit = dit_mod.load_dit(dit_npz, T_lat=T_lat, dtype=dtype, compile_=False)
+
+    def inpaint_model_fn(x, t):
+        return dit(x, t, cross, global_cond, local_add_cond=local_cond)
+
+    # Plain-forward tap: pins the DiT's local-embed path on its own, before
+    # the sampler's redraw chain can blur the signal.
+    t_tap = mx.array(0.5, dtype=mx.float32) * mx.ones((1,), dtype=x0.dtype)
+    v_inpaint = dit(x0, t_tap, cross, global_cond, local_add_cond=local_cond)
+    mx.eval(v_inpaint)
+    # CFG branch must duplicate local_add_cond across the batch (sa3_mlx.py:723).
+    cfg_local = INPAINT_CFG_TAP
+    fn_cfg_local = cfg_model_fn(dit, cross, cross_neg, global_cond,
+                                cfg_local[0], cfg_local[1], local=local_cond)
+    v_cfg_local = fn_cfg_local(x0, mx.array(cfg_local[2], dtype=mx.float32)
+                               * mx.ones((1,), dtype=x0.dtype))
+    mx.eval(v_cfg_local)
+
+    latents_inpaint, _ = sample_loop(inpaint_model_fn, x0, sigmas, seed + 1)
+    # paste-back (sa3_pipeline:147-151): the kept region is forced bit-exact,
+    # mask=1 → keep init, mask=0 → keep the generated latent.
+    fin = latents_inpaint[-1]
+    m = inp_mask.astype(fin.dtype)
+    pasted = init_inpaint.astype(fin.dtype) * m + fin * (1.0 - m)
+    mx.eval(pasted)
+    # The reference applies paste_back INSIDE sample_flow_pingpong; cross-check
+    # the two agree so this hand-copied 3-line formula cannot drift from it.
+    ref_pasted = pipe.sample_flow_pingpong(inpaint_model_fn, x0, sigmas, seed=seed + 1,
+                                           paste_back=(init_inpaint, inp_mask))
+    delta_paste = float(mx.abs(ref_pasted - pasted).max())
+    if delta_paste > 1e-6:
+        raise SystemExit(f"[FATAL] inpaint paste-back diverges from the reference: "
+                         f"max|diff| = {delta_paste}")
+    latents_inpaint_final = pasted.astype(mx.float32)
+    mx.eval(latents_inpaint_final)
+    log(f"  inpaint range {inp_s0}..{inp_s1} of {T_lat} latents "
+        f"({(inp_s1 - inp_s0) / T_lat * 100:.0f}%), paste-back matches "
+        f"(max|diff| = {delta_paste:g})")
+
+    if T_lat > 128 + 2 * 8:
+        patches_inpaint = dec_mod.decode_chunked(decoder, latents_inpaint_final, 128, 8)
+    else:
+        patches_inpaint = decoder(latents_inpaint_final)
+    mx.eval(patches_inpaint)
+    audio_inpaint = pipe.patched_decode(patches_inpaint, patch_size=256, channels=2)
+    audio_inpaint = audio_inpaint[..., : int(round(seconds * SAMPLE_RATE))]
+    mx.eval(audio_inpaint)
+    del dit
+    mx.clear_cache() if hasattr(mx, "clear_cache") else None
+
+    meta["inpaint"] = {
+        "range_sec": [inp_s_sec, inp_e_sec],
+        "range_latents": [inp_s0, inp_s1],
+        "t_lat": T_lat,
+        "cfg_tap": {"cfg": cfg_local[0], "apg": cfg_local[1], "t": cfg_local[2],
+                    "negative_prompt": NEG_PROMPT},
+        "run": "init=trim PCM latents, NO init mix (pure x0), σmax 1.0 schedule, "
+               "local_add_cond + paste-back, seed+1 redraw chain, cfg=1",
+    }
+
     # ── dump
     log(f"dump -> {args.out}")
     f32 = lambda a: np.asarray(np.array(a), dtype=np.float32)  # noqa: E731
@@ -682,6 +785,13 @@ def main(argv=None):
     dump(args.out, "x0_a2a.f32.raw", f32(x0_a2a), meta, dtype="f32")
     dump(args.out, "latents_a2a_final.f32.raw", f32(latents_a2a_final), meta, dtype="f32")
     dump(args.out, "audio_a2a.f32.raw", f32(audio_a2a), meta, dtype="f32")
+    # stage-4 (inpainting) fixtures
+    dump(args.out, "inpaint_mask.f32.raw", f32(inp_mask), meta, dtype="f32")
+    dump(args.out, "inpaint_local_cond.f32.raw", f32(local_cond), meta, dtype="f32")
+    dump(args.out, "inpaint_v_t50.f32.raw", f32(v_inpaint), meta, dtype="f32")
+    dump(args.out, "inpaint_cfg_v_t50.f32.raw", f32(v_cfg_local), meta, dtype="f32")
+    dump(args.out, "latents_inpaint_final.f32.raw", f32(latents_inpaint_final), meta, dtype="f32")
+    dump(args.out, "audio_inpaint.f32.raw", f32(audio_inpaint), meta, dtype="f32")
 
     meta_path = os.path.join(args.out, "meta.json")
     with open(meta_path, "w") as f:
