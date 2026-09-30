@@ -1838,6 +1838,27 @@ pub fn buildPingpongSchedule(a: std.mem.Allocator, steps: usize, sigma_max: f32)
     return out;
 }
 
+/// sa3_mlx.py:705 — the audio-to-audio init mix:
+/// `noise = init*(1−σmax) + pure_noise*σmax`. Both sides f16 (the reference
+/// casts `init.astype(dtype)` against the f16 seeded noise); result f16.
+pub fn mixInitNoise(init: mlx.mlx_array, x0: mlx.mlx_array, sigma_max: f32, s: S) !mlx.mlx_array {
+    const i_term = try mulScalar(init, 1.0 - sigma_max, s);
+    defer _ = mlx.mlx_array_free(i_term);
+    const n_term = try mulScalar(x0, sigma_max, s);
+    defer _ = mlx.mlx_array_free(n_term);
+    return addA(i_term, n_term, s);
+}
+
+/// Fresh wrapper over `x`'s buffer (reshape to its own shape) for the
+/// encoder's oracle taps: the forward pass keeps reassigning its working
+/// handle, and aliasing one handle across two frees would double free.
+fn tapView(x: mlx.mlx_array, s: S) !mlx.mlx_array {
+    const sh = mlx.getShape(x);
+    var v = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_reshape(&v, x, sh.ptr, @intCast(sh.len), s));
+    return v;
+}
+
 /// [1] array of `v` in `dtype`. f64 in, one rounding out — matches the
 /// reference's python float → array.astype(dtype) path.
 fn scalarIn(dtype: mlx.mlx_dtype, v: f64, s: S) !mlx.mlx_array {
@@ -2563,8 +2584,9 @@ fn decAttn(a: std.mem.Allocator, w: *const Weights, x: mlx.mlx_array, blk: usize
     return lin(w, a, flat, op, s);
 }
 
-/// Feed-forward: glu_proj → (value ⊗ gate), sin(·π) gate for blocks >= 5 else SiLU.
-fn decFF(a: std.mem.Allocator, w: *const Weights, x: mlx.mlx_array, blk: usize, s: S) !mlx.mlx_array {
+/// Feed-forward: glu_proj → (value ⊗ gate); `use_sin` picks the sin(·π)
+/// gate (decoder blocks 5..11) over SiLU — the encoder uses SiLU everywhere.
+fn decFF(a: std.mem.Allocator, w: *const Weights, x: mlx.mlx_array, blk: usize, use_sin: bool, s: S) !mlx.mlx_array {
     const gp = try std.fmt.allocPrint(a, "blocks.{d}.ff.glu_proj", .{blk});
     defer a.free(gp);
     const g = try lin(w, a, x, gp, s);
@@ -2575,7 +2597,7 @@ fn decFF(a: std.mem.Allocator, w: *const Weights, x: mlx.mlx_array, blk: usize, 
         for (halves) |hh| _ = mlx.mlx_array_free(hh);
     }
     var act: mlx.mlx_array = undefined;
-    if (blk >= SameL.SIN_START) {
+    if (use_sin) {
         const ang = try mulScalar(halves[1], @as(f32, std.math.pi), s);
         defer _ = mlx.mlx_array_free(ang);
         var sn = mlx.mlx_array_new();
@@ -2689,7 +2711,7 @@ pub const SameLDecoder = struct {
             defer alloc.free(fnp);
             const fnorm = try dyt(alloc, w, fnp, cur, s);
             defer _ = mlx.mlx_array_free(fnorm);
-            const ff = try decFF(alloc, w, fnorm, i, s);
+            const ff = try decFF(alloc, w, fnorm, i, i >= SameL.SIN_START, s);
             defer _ = mlx.mlx_array_free(ff);
             const after_ff = try addA(cur, ff, s);
             _ = mlx.mlx_array_free(cur);
@@ -2786,6 +2808,197 @@ pub const SameLDecoder = struct {
     }
 };
 
+// ── SAME-L encoder (reference = same_l_encoder.py) ──────────────────────────
+//
+// `same_l_encoder_f32.safetensors` ships dense f32 verbatim (no quant keys),
+// mmap-backed like every pack file — an engine that never runs
+// audio-to-audio never pages its pages in. Inverse of the decoder: stereo
+// f32 PCM [1,2,S] at 44.1 kHz → latents f32 [1,256,T_lat]. Same blocks as
+// the decoder with the sin-gate replaced by SiLU everywhere, a 1×1 mapping
+// 512→1536, ONE learned token appended per 16-position group, and a
+// softnorm head (x·scale + bias) / running_std. The sampler casts f16
+// before the init mix (reference `init.astype(dtype)`).
+
+pub const SameLEncoder = struct {
+    w: Weights,
+    swa_mask: mlx.mlx_array, // [17, 51] f32, 0 / -1e9 — the decoder's own band
+
+    /// Mid-forward taps for the oracle tests: each array is a fresh wrapper
+    /// (tapView) owned by the CALLER; production passes null and captures
+    /// nothing.
+    pub const EncodeTaps = struct {
+        /// after mapping + 17-group regroup, before the blocks
+        mapped: ?mlx.mlx_array = null,
+        /// after block 6 of 12
+        block6: ?mlx.mlx_array = null,
+    };
+
+    pub fn load(io: std.Io, a: std.mem.Allocator, model_dir: []const u8) !SameLEncoder {
+        var w = try loadFileWeights(a, model_dir, "same_l_encoder_f32.safetensors");
+        errdefer w.deinit();
+        // same static mask as the decoder: valid iff kv >= q and kv <= q+34
+        const w_n: usize = @intCast(SameL.W);
+        const q_n: usize = @intCast(SameL.SUB_CHUNK);
+        const buf = try a.alloc(f32, q_n * w_n);
+        defer a.free(buf);
+        for (0..q_n) |q| {
+            for (0..w_n) |kv| {
+                buf[q * w_n + kv] = if (kv >= q and kv <= q + 2 * q_n) 0.0 else -1e9;
+            }
+        }
+        const msh = [2]c_int{ SameL.SUB_CHUNK, SameL.W };
+        const m = mlx.mlx_array_new_data(buf.ptr, &msh, 2, .float32);
+        _ = io;
+        return .{ .w = w, .swa_mask = m };
+    }
+
+    pub fn deinit(self: *SameLEncoder) void {
+        _ = mlx.mlx_array_free(self.swa_mask);
+        self.w.deinit();
+    }
+
+    /// reference same_l_encoder.py:77-111 — pcm f32 [1,2,S] (44.1 kHz
+    /// stereo, WAV-decoded by the route) → trim/zero-pad to the
+    /// t_lat*4096 sample grid → patch (h=256) → mapping 512→1536 → regroup
+    /// into 16-position groups with one learned new_token APPENDED at the
+    /// end → 12 blocks (SiLU FF, no sin gates) → last position of each
+    /// group → project_out 1536→256 → softnorm. Returns f32 [1,256,t_lat].
+    pub fn encode(
+        self: *SameLEncoder,
+        alloc: std.mem.Allocator,
+        pcm: mlx.mlx_array,
+        t_lat: c_int,
+        taps: ?*EncodeTaps,
+        s: S,
+    ) !mlx.mlx_array {
+        const psh = mlx.getShape(pcm);
+        if (psh.len != 3 or psh[1] != 2) return error.InvalidInitAudio;
+        const w = &self.w;
+
+        // sa3_mlx.py:664-681 — pad or trim to enc_T_lat * SAMPLES_PER_LATENT
+        // (SAME-L pad_mod 16 makes enc_T_lat == T_lat for every T_lat).
+        const target = t_lat * 4096;
+        const have: c_int = @intCast(psh[2]);
+        var audio = pcm;
+        var audio_owned = false;
+        defer if (audio_owned) {
+            _ = mlx.mlx_array_free(audio);
+        };
+        if (have > target) {
+            audio = try sliceAxis2(pcm, 0, target, s);
+            audio_owned = true;
+        } else if (have < target) {
+            const zsh = [3]c_int{ 1, 2, target - have };
+            var z = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_zeros(&z, &zsh, 3, .float32, s));
+            defer _ = mlx.mlx_array_free(z);
+            audio = try concatA(pcm, z, 2, s);
+            audio_owned = true;
+        }
+
+        // patch_audio: rearrange("b c (l h) -> b (c h) l", h=256)
+        const l = t_lat * 16;
+        const r4 = [4]c_int{ 1, 2, l, 256 };
+        var gp = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_reshape(&gp, audio, &r4, 4, s));
+        defer _ = mlx.mlx_array_free(gp);
+        const t4 = [4]c_int{ 0, 1, 3, 2 };
+        var tp = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_transpose_axes(&tp, gp, &t4, 4, s));
+        defer _ = mlx.mlx_array_free(tp);
+        const p512 = [3]c_int{ 1, 512, l };
+        var patches = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_reshape(&patches, tp, &p512, 3, s));
+        defer _ = mlx.mlx_array_free(patches);
+
+        // mapping: Linear 512 → 1536 over the channel dim
+        const ht = try transposeA(patches, &[_]c_int{ 0, 2, 1 }, s);
+        defer _ = mlx.mlx_array_free(ht);
+        var cur = try lin(w, alloc, ht, "mapping", s);
+
+        // regroup: 16 audio positions per latent, ONE learned token at END
+        // (the decoder prepends its 16; encoder appends its 1) → 17-groups
+        const g3 = [3]c_int{ t_lat, 16, SameL.DIM };
+        var r3 = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_reshape(&r3, cur, &g3, 3, s));
+        defer _ = mlx.mlx_array_free(r3);
+        const nt = w.get("new_tokens") orelse return error.MissingWeight;
+        const nsh = [3]c_int{ t_lat, 1, SameL.DIM };
+        var ntb = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_broadcast_to(&ntb, nt, &nsh, 3, s));
+        defer _ = mlx.mlx_array_free(ntb);
+        const cat = try concatA(r3, ntb, 1, s);
+        defer _ = mlx.mlx_array_free(cat);
+        const esh = [3]c_int{ 1, t_lat * SameL.SUB_CHUNK, SameL.DIM };
+        var reg = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_reshape(&reg, cat, &esh, 3, s));
+        _ = mlx.mlx_array_free(cur);
+        cur = reg;
+        if (taps) |tk| {
+            tk.mapped = try tapView(cur, s);
+        }
+
+        // 12 residual blocks — SiLU FF everywhere (encoder: use_sin=False)
+        for (0..SameL.BLOCKS) |i| {
+            const pnp = try std.fmt.allocPrint(alloc, "blocks.{d}.pre_norm", .{i});
+            defer alloc.free(pnp);
+            const hn = try dyt(alloc, w, pnp, cur, s);
+            defer _ = mlx.mlx_array_free(hn);
+            const att = try decAttn(alloc, w, hn, i, self.swa_mask, s);
+            defer _ = mlx.mlx_array_free(att);
+            const after_att = try addA(cur, att, s);
+            _ = mlx.mlx_array_free(cur);
+            cur = after_att;
+
+            const fnp = try std.fmt.allocPrint(alloc, "blocks.{d}.ff_norm", .{i});
+            defer alloc.free(fnp);
+            const fnorm = try dyt(alloc, w, fnp, cur, s);
+            defer _ = mlx.mlx_array_free(fnorm);
+            const ff = try decFF(alloc, w, fnorm, i, false, s);
+            defer _ = mlx.mlx_array_free(ff);
+            const after_ff = try addA(cur, ff, s);
+            _ = mlx.mlx_array_free(cur);
+            cur = after_ff;
+
+            if (taps) |tk| {
+                if (i == 5) tk.block6 = try tapView(cur, s);
+            }
+        }
+
+        // last position of every 17-group (the new_token's output)
+        const gsh4 = [4]c_int{ 1, t_lat, SameL.SUB_CHUNK, SameL.DIM };
+        var r4b = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_reshape(&r4b, cur, &gsh4, 4, s));
+        _ = mlx.mlx_array_free(cur);
+        defer _ = mlx.mlx_array_free(r4b);
+        const lo = [4]c_int{ 0, 0, SameL.SUB_CHUNK - 1, 0 };
+        const hi = [4]c_int{ 1, t_lat, SameL.SUB_CHUNK, SameL.DIM };
+        const stp = [4]c_int{ 1, 1, 1, 1 };
+        var sl = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_slice(&sl, r4b, &lo, 4, &hi, 4, &stp, 4, s));
+        defer _ = mlx.mlx_array_free(sl);
+        const fsh = [3]c_int{ 1, t_lat, SameL.DIM };
+        var last = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_reshape(&last, sl, &fsh, 3, s));
+        defer _ = mlx.mlx_array_free(last);
+
+        // project_out 1536 → 256, channels-first, then the softnorm head
+        // (reference: `x * scaling_factor + bias` then `x / running_std`)
+        const proj = try lin(w, alloc, last, "project_out", s);
+        defer _ = mlx.mlx_array_free(proj);
+        const outt = try transposeA(proj, &[_]c_int{ 0, 2, 1 }, s);
+        defer _ = mlx.mlx_array_free(outt);
+        const sf = w.get("scaling_factor") orelse return error.MissingWeight;
+        const sb = w.get("bias") orelse return error.MissingWeight;
+        const rs = w.get("running_std") orelse return error.MissingWeight;
+        const t1 = try mulA(outt, sf, s);
+        defer _ = mlx.mlx_array_free(t1);
+        const t2 = try addA(t1, sb, s);
+        defer _ = mlx.mlx_array_free(t2);
+        return divA(t2, rs, s);
+    }
+};
+
 // ── SAME-L decoder oracle ───────────────────────────────────────────────────
 
 test "stable_audio3 oracle: SAME-L decoder arms match reference" {
@@ -2862,6 +3075,11 @@ fn sliceAxis2(x: mlx.mlx_array, lo: c_int, hi: c_int, s: S) !mlx.mlx_array {
 pub const MIN_DURATION_S: u32 = 1;
 pub const MAX_DURATION_S: u32 = 384;
 pub const DEFAULT_STEPS: u32 = 8;
+/// Output / init-audio sample rate (the SAME codecs run at 44.1 kHz).
+pub const SAMPLE_RATE: u32 = 44100;
+/// σmax floor (sa3_mlx.py MIN_SIGMA): the rf_denoiser is undefined at t≈0
+/// and emits NaN below it — the route names a 400 and generate() refuses.
+pub const MIN_SIGMA: f32 = 0.01;
 pub const MAX_STEPS: u32 = 100;
 
 pub const GenerateRequest = struct {
@@ -2881,6 +3099,15 @@ pub const GenerateRequest = struct {
     /// cfg_scale != 1.0. 1.0 = full projection (reference default),
     /// 0.0 = vanilla CFG, in between blends.
     apg: f32 = 1.0,
+    /// Audio-to-audio (sa3_mlx `--init-audio`): stereo f32 PCM [1,2,S] at
+    /// 44.1 kHz, BORROWED for the call (the caller frees it after). The
+    /// engine pads/trims to the duration's sample grid, encodes with the
+    /// SAME-L encoder, and mixes into the seeded noise per init_noise_level.
+    init_audio: ?mlx.mlx_array = null,
+    /// σmax (sa3_mlx `--init-noise-level`, default 1.0 = reference). Drives
+    /// the schedule in ANY mode and the init mix when init_audio rides;
+    /// floor MIN_SIGMA (0.01) — the model is undefined at t≈0.
+    init_noise_level: f32 = 1.0,
 };
 
 pub const Generated = struct {
@@ -2898,6 +3125,7 @@ pub const Engine = struct {
     t5: T5Gemma,
     dit: Dit,
     dec: SameLDecoder,
+    enc: SameLEncoder,
 
     pub fn load(io: std.Io, a: std.mem.Allocator, model_dir: []const u8) !*Engine {
         const self = try a.create(Engine);
@@ -2914,15 +3142,20 @@ pub const Engine = struct {
         errdefer self.dit.deinit();
         self.dec = try SameLDecoder.load(io, a, model_dir);
         errdefer self.dec.deinit();
-        log.info("[sa3] engine ready (t5 {d} + dit {d} + decoder {d} tensors)\n", .{
+        // mmap-backed like every pack file: headers here, pages on first use
+        self.enc = try SameLEncoder.load(io, a, model_dir);
+        errdefer self.enc.deinit();
+        log.info("[sa3] engine ready (t5 {d} + dit {d} + decoder {d} + encoder {d} tensors)\n", .{
             self.t5.w.count(),
             self.dit.w.count(),
             self.dec.w.count(),
+            self.enc.w.count(),
         });
         return self;
     }
 
     pub fn deinit(self: *Engine) void {
+        self.enc.deinit();
         self.dec.deinit();
         self.dit.deinit();
         self.t5.deinit();
@@ -2943,6 +3176,13 @@ pub const Engine = struct {
         // the reference formula already treats <0 as 0 and >1 as 1.
         if (!std.math.isFinite(req.cfg_scale)) return error.InvalidCfgScale;
         const apg = std.math.clamp(req.apg, 0.0, 1.0);
+        // audio-to-audio σmax floor (sa3_mlx.py:538-542 MIN_SIGMA) — checked
+        // unconditionally like the reference, even without init_audio (below
+        // the floor the rf_denoiser is undefined at t≈0 and emits NaN).
+        // isFinite first so NaN never slips past the range check.
+        if (!std.math.isFinite(req.init_noise_level) or req.init_noise_level < MIN_SIGMA)
+            return error.InvalidSigmaMax;
+        const sigma_max: f32 = req.init_noise_level;
 
         // tokenize; the reference truncates at prompt_max_len (256)
         const ids_full = try self.tok.encode(allocator, req.prompt);
@@ -2976,8 +3216,23 @@ pub const Engine = struct {
         try mlx.check(mlx.mlx_random_normal(&x0, &nsh, 3, .float16, 0.0, 1.0, k0, self.s));
         defer _ = mlx.mlx_array_free(x0);
 
-        const sigmas = try buildPingpongSchedule(allocator, steps, 1.0);
+        const sigmas = try buildPingpongSchedule(allocator, steps, sigma_max);
         defer allocator.free(sigmas);
+
+        // audio-to-audio (sa3_mlx.py:639-709): encode the init PCM on the
+        // duration's sample grid, cast f16 (reference `init.astype(dtype)`),
+        // mix noise = init*(1−σ) + x0*σ. x0's defer above frees whatever
+        // ends up bound; the original handle is released here before the
+        // reassignment (handles are owners, not shared refs).
+        if (req.init_audio) |pcm| {
+            const init = try self.enc.encode(allocator, pcm, @intCast(t_lat), null, self.s);
+            defer _ = mlx.mlx_array_free(init);
+            const init16 = try astype(init, .float16, self.s);
+            defer _ = mlx.mlx_array_free(init16);
+            const mixed = try mixInitNoise(init16, x0, sigma_max, self.s);
+            _ = mlx.mlx_array_free(x0);
+            x0 = mixed;
+        }
 
         // redraws: (key, sub) = split(key); draw sub at every step with
         // t_next > 0 before the last — dtype follows x (f16 at step 0, f32
@@ -3271,4 +3526,180 @@ test "stable_audio3 oracle: end-to-end CFG generation matches reference audio" {
     const arr = mlx.mlx_array_new_data(out.samples.ptr, &sh, 3, .float32);
     defer _ = mlx.mlx_array_free(arr);
     try assertParity(arr, ref, "e2e cfg audio", 0.99, 0.05, st);
+}
+
+// ── audio-to-audio oracle (stage 3) ─────────────────────────────────────────
+//
+// Fixtures from dump_stable_audio3_fixtures stage 7: init-WAV PCM in both
+// prep paths (pad + trim), encoder taps, the σmax=0.5 schedule, the init
+// mix, and a full run (init mix + σmax schedule, cfg=1) decoded to audio.
+
+test "stable_audio3 oracle: σmax schedule + SAME-L encoder taps match reference" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const dir = try sa3ModelDir();
+    const fix = try fixturesDir();
+    const st = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(st);
+
+    // schedule with σmax=0.5: logsnr warp re-anchored to σmax (sa3_pipeline:90)
+    const built = try buildPingpongSchedule(a, 8, 0.5);
+    defer a.free(built);
+    const sig_raw = try readRawF32(io, a, fix, "sigmas_smax05.f32.raw");
+    defer a.free(sig_raw);
+    try testing.expectEqual(built.len, sig_raw.len);
+    const sig_arr = mlx.mlx_array_new_data(built.ptr, &[_]c_int{@intCast(built.len)}, 1, .float32);
+    defer _ = mlx.mlx_array_free(sig_arr);
+    try assertParity(sig_arr, sig_raw, "sigmas σmax=0.5", 0.9999, 0.001, st);
+
+    var enc = try SameLEncoder.load(io, a, dir);
+    defer enc.deinit();
+
+    // LONG pcm → trim path, with the mid-stack taps
+    const pcm_raw = try readRawF32(io, a, fix, "init_pcm_trim.f32.raw");
+    defer a.free(pcm_raw);
+    const pcm_sh = [3]c_int{ 1, 2, @intCast(pcm_raw.len / 2) };
+    const pcm = mlx.mlx_array_new_data(pcm_raw.ptr, &pcm_sh, 3, .float32);
+    defer _ = mlx.mlx_array_free(pcm);
+    const t_lat: c_int = 162; // meta.a2a: T_lat for the 15 s run
+
+    var taps: SameLEncoder.EncodeTaps = .{};
+    const lat = try enc.encode(a, pcm, t_lat, &taps, st);
+    defer _ = mlx.mlx_array_free(lat);
+    defer {
+        if (taps.mapped) |m| _ = mlx.mlx_array_free(m);
+        if (taps.block6) |b| _ = mlx.mlx_array_free(b);
+    }
+    const mapped_ref = try readRawF32(io, a, fix, "enc_mapped.f32.raw");
+    defer a.free(mapped_ref);
+    try assertParity(taps.mapped.?, mapped_ref, "enc mapped+regroup", 0.9999, 0.001, st);
+    const b6_ref = try readRawF32(io, a, fix, "enc_block6.f32.raw");
+    defer a.free(b6_ref);
+    try assertParity(taps.block6.?, b6_ref, "enc block6", 0.9999, 0.001, st);
+    const trim_ref = try readRawF32(io, a, fix, "init_latents_trim.f32.raw");
+    defer a.free(trim_ref);
+    try assertParity(lat, trim_ref, "init latents trim", 0.9999, 0.001, st);
+
+    // SHORT pcm → zero-pad path (same target grid, extended before patching)
+    const pad_raw = try readRawF32(io, a, fix, "init_pcm_pad.f32.raw");
+    defer a.free(pad_raw);
+    const pad_sh = [3]c_int{ 1, 2, @intCast(pad_raw.len / 2) };
+    const pcm_pad = mlx.mlx_array_new_data(pad_raw.ptr, &pad_sh, 3, .float32);
+    defer _ = mlx.mlx_array_free(pcm_pad);
+    const lat_pad = try enc.encode(a, pcm_pad, t_lat, null, st);
+    defer _ = mlx.mlx_array_free(lat_pad);
+    const pad_ref = try readRawF32(io, a, fix, "init_latents_pad.f32.raw");
+    defer a.free(pad_ref);
+    try assertParity(lat_pad, pad_ref, "init latents pad", 0.9999, 0.001, st);
+}
+
+test "stable_audio3 oracle: audio-to-audio init mix matches reference" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const dir = try sa3ModelDir();
+    const fix = try fixturesDir();
+    const st = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(st);
+
+    var enc = try SameLEncoder.load(io, a, dir);
+    defer enc.deinit();
+    const pcm_raw = try readRawF32(io, a, fix, "init_pcm_trim.f32.raw");
+    defer a.free(pcm_raw);
+    const pcm_sh = [3]c_int{ 1, 2, @intCast(pcm_raw.len / 2) };
+    const pcm = mlx.mlx_array_new_data(pcm_raw.ptr, &pcm_sh, 3, .float32);
+    defer _ = mlx.mlx_array_free(pcm);
+    const lat = try enc.encode(a, pcm, 162, null, st);
+    defer _ = mlx.mlx_array_free(lat);
+
+    // the reference mixes init.astype(f16) against the f16 seeded noise x0
+    const init16 = try astype(lat, .float16, st);
+    defer _ = mlx.mlx_array_free(init16);
+    const x0_raw = try readRawF32(io, a, fix, "x0.f32.raw");
+    defer a.free(x0_raw);
+    const x0_32 = mlx.mlx_array_new_data(x0_raw.ptr, &[_]c_int{ 1, 256, @intCast(x0_raw.len / 256) }, 3, .float32);
+    defer _ = mlx.mlx_array_free(x0_32);
+    const x0 = try astype(x0_32, .float16, st);
+    defer _ = mlx.mlx_array_free(x0);
+
+    const mixed = try mixInitNoise(init16, x0, 0.5, st);
+    defer _ = mlx.mlx_array_free(mixed);
+    const ref = try readRawF32(io, a, fix, "x0_a2a.f32.raw");
+    defer a.free(ref);
+    try assertParity(mixed, ref, "init mix", 0.9999, 0.001, st);
+}
+
+test "stable_audio3 oracle: audio-to-audio end-to-end matches reference audio" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const dir = try sa3ModelDir();
+    const fix = try fixturesDir();
+    const st = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(st);
+
+    var eng = try Engine.load(io, a, dir);
+    defer eng.deinit();
+    // same dequantize-for-test rule as the plain e2e (fixtures = dequantized pack).
+    try dequantizeForTest(&eng.t5.w, st);
+    try dequantizeForTest(&eng.dit.w, st);
+
+    const pcm_raw = try readRawF32(io, a, fix, "init_pcm_trim.f32.raw");
+    defer a.free(pcm_raw);
+    const pcm_sh = [3]c_int{ 1, 2, @intCast(pcm_raw.len / 2) };
+    const pcm = mlx.mlx_array_new_data(pcm_raw.ptr, &pcm_sh, 3, .float32);
+    defer _ = mlx.mlx_array_free(pcm);
+
+    const out = try eng.generate(a, .{
+        .prompt = "A beautiful piano arpeggio grows into a cinematic climax",
+        .seconds = 15.0,
+        .steps = 8,
+        .seed = 1234,
+        .init_audio = pcm,
+        .init_noise_level = 0.5,
+    }, null);
+    defer a.free(out.samples);
+
+    const ref = try readRawF32(io, a, fix, "audio_a2a.f32.raw");
+    defer a.free(ref);
+    const want: usize = 661500; // 15 s * 44100, same trim the reference applies
+    try testing.expectEqual(@as(usize, want * 2), out.samples.len);
+
+    const sh = [_]c_int{ 1, 2, @intCast(want) };
+    const arr = mlx.mlx_array_new_data(out.samples.ptr, &sh, 3, .float32);
+    defer _ = mlx.mlx_array_free(arr);
+    try assertParity(arr, ref, "e2e a2a audio", 0.99, 0.05, st);
+}
+
+test "stable_audio3: audio-to-audio refuses σmax below MIN_SIGMA and non-stereo pcm" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const dir = try sa3ModelDir();
+    var eng = try Engine.load(io, a, dir);
+    defer eng.deinit();
+
+    // the model is undefined at t≈0 — the reference errors below 0.01 (NaN out)
+    try testing.expectError(error.InvalidSigmaMax, eng.generate(a, .{
+        .prompt = "x",
+        .seconds = 15.0,
+        .steps = 8,
+        .seed = 1,
+        .init_noise_level = 0.005,
+    }, null));
+
+    // pcm must be stereo [1,2,S] — a mono array would mis-patch silently
+    const zbuf = try a.alloc(f32, 4096);
+    defer a.free(zbuf);
+    @memset(zbuf, 0);
+    const bad = mlx.mlx_array_new_data(zbuf.ptr, &[_]c_int{ 1, 1, 4096 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(bad);
+    try testing.expectError(error.InvalidInitAudio, eng.generate(a, .{
+        .prompt = "x",
+        .seconds = 15.0,
+        .steps = 8,
+        .seed = 1,
+        .init_audio = bad,
+    }, null));
 }
