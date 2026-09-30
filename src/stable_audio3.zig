@@ -1803,7 +1803,7 @@ test "stable_audio3 oracle: CFG velocity taps match reference (apg branches + ze
             .cfg = tap.cfg,
             .apg = tap.apg,
             .null_cross = if (tap.neg) cross_neg else zeros_cross,
-        }, st);
+        }, null, st);
         defer _ = mlx.mlx_array_free(v);
         try assertParity(v, ref, tap.label, 0.999, 0.01, st);
     }
@@ -1847,6 +1847,70 @@ pub fn mixInitNoise(init: mlx.mlx_array, x0: mlx.mlx_array, sigma_max: f32, s: S
     const n_term = try mulScalar(x0, sigma_max, s);
     defer _ = mlx.mlx_array_free(n_term);
     return addA(i_term, n_term, s);
+}
+
+/// Python's `round()` — ties go to the EVEN side (banker's rounding), which
+/// is what sa3_mlx.py:525-528 uses to map the inpaint range onto latents.
+/// A plain @round would land one latent off for an input that hits .5 exactly.
+fn roundEven(v: f64) f64 {
+    const fl = @floor(v);
+    const d = v - fl;
+    if (d > 0.5) return fl + 1.0;
+    if (d < 0.5) return fl;
+    return if (@mod(fl, 2.0) == 0.0) fl else fl + 1.0;
+}
+
+/// Inpaint mask over the latent axis (sa3_mlx.py:519-528): 1 = keep the init
+/// audio, 0 = regenerate everything inside [s0, s1). [1, 1, T_lat] f32 — the
+/// reference builds it as an f32 numpy array.
+pub fn buildInpaintMask(a: std.mem.Allocator, t_lat: usize, s0: usize, s1: usize) !mlx.mlx_array {
+    const buf = try a.alloc(f32, t_lat);
+    defer a.free(buf);
+    @memset(buf, 1.0);
+    for (buf, 0..) |*v, i| {
+        if (i >= s0 and i < s1) v.* = 0.0;
+    }
+    const sh = [3]c_int{ 1, 1, @intCast(t_lat) };
+    // mlx_array_new_data copies `buf`, so freeing it here is safe.
+    return mlx.mlx_array_new_data(buf.ptr, &sh, 3, .float32);
+}
+
+/// `local_add_cond` (sa3_mlx.py:718-722): concat([mask, init.astype(f32)·mask])
+/// over the channel axis → batch-last-channel transpose → f16 [1, T_lat, 257].
+/// `init16` is the SAME-L encoder output already cast to the run dtype, which
+/// is what the reference feeds both this and the paste-back.
+pub fn buildInpaintLocalCond(init16: mlx.mlx_array, mask: mlx.mlx_array, s: S) !mlx.mlx_array {
+    const init32 = try astype(init16, .float32, s);
+    defer _ = mlx.mlx_array_free(init32);
+    const masked = try mulA(init32, mask, s);
+    defer _ = mlx.mlx_array_free(masked);
+    const cat = try concatA(mask, masked, 1, s);
+    defer _ = mlx.mlx_array_free(cat);
+    const axes = [_]c_int{ 0, 2, 1 };
+    const swapped = try transposeA(cat, &axes, s);
+    defer _ = mlx.mlx_array_free(swapped);
+    return astype(swapped, .float16, s);
+}
+
+/// Paste-back (sa3_pipeline.py:147-151): `x = init·m + x·(1−m)` — the kept
+/// region (m=1) is forced back to the init latents bit-for-bit, the
+/// regenerating region (m=0) keeps whatever the sampler produced. Applied to
+/// the FINAL latent only, which is all the reference returns and decodes.
+pub fn pasteBackLatents(init16: mlx.mlx_array, x: mlx.mlx_array, mask: mlx.mlx_array, s: S) !mlx.mlx_array {
+    const dt = mlx.mlx_array_dtype(x);
+    const m = try astype(mask, dt, s);
+    defer _ = mlx.mlx_array_free(m);
+    const init_dt = try astype(init16, dt, s);
+    defer _ = mlx.mlx_array_free(init_dt);
+    const kept = try mulA(init_dt, m, s);
+    defer _ = mlx.mlx_array_free(kept);
+    const one = try scalarLike(m, 1.0, s);
+    defer _ = mlx.mlx_array_free(one);
+    const inv = try subA(one, m, s);
+    defer _ = mlx.mlx_array_free(inv);
+    const gen = try mulA(x, inv, s);
+    defer _ = mlx.mlx_array_free(gen);
+    return addA(kept, gen, s);
 }
 
 /// Fresh wrapper over `x`'s buffer (reshape to its own shape) for the
@@ -1900,7 +1964,9 @@ fn zerosLikeCross(cross: mlx.mlx_array, s: S) !mlx.mlx_array {
 /// cat([x, x]); the blend happens in DENOISED space (RF: d = x − σ·v with
 /// σ = t), optionally projecting the CFG difference orthogonal to cond_d
 /// (APG), then converts back to velocity in x's dtype. `t` is the sampler's
-/// [1] f32 sigma. Returns an owned velocity for the batch-1 `x`.
+/// [1] f32 sigma. `local` is the inpainting local_add_cond, duplicated across
+/// the batch like sa3_mlx.py:723 (`lac2 = None if … else concat([lac, lac])`).
+/// Returns an owned velocity for the batch-1 `x`.
 fn cfgVelocity(
     a: std.mem.Allocator,
     dit: *const Dit,
@@ -1909,6 +1975,7 @@ fn cfgVelocity(
     cross: mlx.mlx_array,
     global_cond: mlx.mlx_array,
     g: Guidance,
+    local: ?mlx.mlx_array,
     s: S,
 ) !mlx.mlx_array {
     // ── batched forward: x2 [2,256,T], t2 [2], cross2 [2,S+1,768], g2 [2,768]
@@ -1920,7 +1987,11 @@ fn cfgVelocity(
     defer _ = mlx.mlx_array_free(cross2);
     const global2 = try concatA(global_cond, global_cond, 0, s);
     defer _ = mlx.mlx_array_free(global2);
-    const vb = try dit.forward(a, x2, t2, cross2, global2, null, s);
+    const local2 = if (local) |l| try concatA(l, l, 0, s) else null;
+    defer {
+        if (local2) |l| _ = mlx.mlx_array_free(l);
+    }
+    const vb = try dit.forward(a, x2, t2, cross2, global2, local2, s);
     defer _ = mlx.mlx_array_free(vb);
     var parts = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(parts);
@@ -2020,13 +2091,30 @@ fn cfgVelocity(
     return astype(v32, mlx.mlx_array_dtype(x), s);
 }
 
+/// Inpainting state threaded through the sampler (stage 4): `local` rides
+/// every DiT forward (duplicated across the CFG batch), `init`/`mask` are the
+/// paste-back operands. All three are BORROWED — the caller owns them and
+/// frees them after sampling, exactly like `Guidance.null_cross`.
+pub const Inpaint = struct {
+    /// [1, T_lat, 257] f16 — (mask, masked_init), sa3_mlx.py:718-722.
+    local: mlx.mlx_array,
+    /// [1, 256, T_lat] f16 — the SAME-L encoder output, cast to the run dtype.
+    init: mlx.mlx_array,
+    /// [1, 1, T_lat] f32 — 1 = keep the init, 0 = regenerate.
+    mask: mlx.mlx_array,
+};
+
 /// One rf_denoiser ping-pong loop. `sigmas` is the host schedule (len
 /// steps+1); `noises[k]` is the k-th redraw — drawn only while
 /// i < steps−1 && t_next > 0, so callers size it steps−1 for a healthy
 /// schedule (the engine passes MLX-random draws, the oracle fixtures).
 /// `guidance` non-null swaps the per-step forward for the batched CFG
 /// denoiser (cfgVelocity). Returns `steps` latents; caller frees each plus
-/// the slice.
+/// the slice. `inpaint` non-null threads its `local_add_cond` through every
+/// forward and pastes the kept region back over the FINAL latent once the
+/// loop ends — the reference applies paste_back inside
+/// sample_flow_pingpong to the single latent it returns and decodes
+/// (sa3_pipeline.py:147-151), so intermediate latents stay untouched.
 pub fn samplePingPong(
     a: std.mem.Allocator,
     dit: *const Dit,
@@ -2036,6 +2124,7 @@ pub fn samplePingPong(
     cross: mlx.mlx_array,
     global_cond: mlx.mlx_array,
     guidance: ?Guidance,
+    inpaint: ?Inpaint,
     progress: ?sse.Progress,
     s: S,
 ) ![]mlx.mlx_array {
@@ -2044,6 +2133,7 @@ pub fn samplePingPong(
     errdefer a.free(outs);
     var cur = x0;
     var draw: usize = 0;
+    const local: ?mlx.mlx_array = if (inpaint) |ip| ip.local else null;
     for (0..steps) |i| {
         // A hung-up client latches `cancelled`; stop at the next step
         // boundary (music3 does the same per chunk) instead of burning GPU
@@ -2057,9 +2147,9 @@ pub fn samplePingPong(
         const t_ten = try scalarIn(.float32, t_curr, s);
         defer _ = mlx.mlx_array_free(t_ten);
         const v = if (guidance) |g|
-            try cfgVelocity(a, dit, cur, t_ten, cross, global_cond, g, s)
+            try cfgVelocity(a, dit, cur, t_ten, cross, global_cond, g, local, s)
         else
-            try dit.forward(a, cur, t_ten, cross, global_cond, null, s);
+            try dit.forward(a, cur, t_ten, cross, global_cond, local, s);
         defer _ = mlx.mlx_array_free(v);
 
         // denoised = x − t_curr.astype(x.dtype) * v
@@ -2097,6 +2187,16 @@ pub fn samplePingPong(
         outs[i] = next;
         cur = next;
         if (progress) |p| p.emit("sample", @intCast(i + 1), @intCast(steps));
+    }
+    // paste-back (sa3_pipeline.py:147-151): only the FINAL latent is what the
+    // reference returns and decodes, so only that one is overwritten; the
+    // intermediates were never part of its contract.
+    if (inpaint) |ip| {
+        const fin = outs[steps - 1];
+        const pasted = try pasteBackLatents(ip.init, fin, ip.mask, s);
+        _ = mlx.mlx_array_free(fin);
+        outs[steps - 1] = pasted;
+        evalA(pasted);
     }
     return outs;
 }
@@ -2171,7 +2271,7 @@ test "stable_audio3 oracle: ping-pong sampler latents match reference" {
         }
     };
 
-    const lats = try samplePingPong(a, &dit, x0, sig_raw, noises[0..], cross, glob, null, null, st);
+    const lats = try samplePingPong(a, &dit, x0, sig_raw, noises[0..], cross, glob, null, null, null, st);
     defer {
         for (lats) |l| _ = mlx.mlx_array_free(l);
         a.free(lats);
@@ -2257,7 +2357,7 @@ test "stable_audio3 oracle: ping-pong + CFG guidance final latent matches refere
         .cfg = 3.0,
         .apg = 1.0,
         .null_cross = cross_neg,
-    }, null, st);
+    }, null, null, st);
     defer {
         for (lats) |l| _ = mlx.mlx_array_free(l);
         a.free(lats);
@@ -3082,6 +3182,13 @@ pub const SAMPLE_RATE: u32 = 44100;
 pub const MIN_SIGMA: f32 = 0.01;
 pub const MAX_STEPS: u32 = 100;
 
+/// Inpaint range in seconds — the wire carries `inpaint_range: [start, end]`
+/// and the reference CLI takes `--inpaint-range START,END`.
+pub const InpaintRange = struct {
+    start: f32,
+    end: f32,
+};
+
 pub const GenerateRequest = struct {
     prompt: []const u8,
     seconds: f32 = 30.0,
@@ -3103,11 +3210,20 @@ pub const GenerateRequest = struct {
     /// 44.1 kHz, BORROWED for the call (the caller frees it after). The
     /// engine pads/trims to the duration's sample grid, encodes with the
     /// SAME-L encoder, and mixes into the seeded noise per init_noise_level.
+    /// With `inpaint_range` set the SAME encoding feeds the mask instead —
+    /// inpainting never mixes the init into the noise.
     init_audio: ?mlx.mlx_array = null,
     /// σmax (sa3_mlx `--init-noise-level`, default 1.0 = reference). Drives
     /// the schedule in ANY mode and the init mix when init_audio rides;
     /// floor MIN_SIGMA (0.01) — the model is undefined at t≈0.
     init_noise_level: f32 = 1.0,
+    /// Inpainting (sa3_mlx `--inpaint-range START,END`): regenerate the audio
+    /// inside [start, end) seconds while the rest of `init_audio` is kept
+    /// exactly. Requires `init_audio` (nothing to inpaint into otherwise) and
+    /// `0 <= start < end <= seconds`. The init is NOT mixed into the noise —
+    /// the DiT conditions on (mask, masked_init) and the kept region is
+    /// pasted back over the final latent when sampling ends.
+    inpaint_range: ?InpaintRange = null,
 };
 
 pub const Generated = struct {
@@ -3176,6 +3292,22 @@ pub const Engine = struct {
         // the reference formula already treats <0 as 0 and >1 as 1.
         if (!std.math.isFinite(req.cfg_scale)) return error.InvalidCfgScale;
         const apg = std.math.clamp(req.apg, 0.0, 1.0);
+        // inpainting (sa3_mlx.py:514-528) — checked BEFORE the σmax floor,
+        // the reference's own order. `seconds` is already clamped to the
+        // engine's supported range, so an end past it fails loud instead of
+        // silently narrowing the range.
+        var inp_s0: usize = 0;
+        var inp_s1: usize = 0;
+        if (req.inpaint_range) |r| {
+            if (req.init_audio == null) return error.InpaintRequiresInit;
+            if (!std.math.isFinite(r.start) or !std.math.isFinite(r.end) or
+                r.start < 0.0 or r.start >= r.end or @as(f64, r.end) > seconds)
+                return error.InvalidInpaintRange;
+            // seconds → latents, sa3_mlx.py:525-528: Python's round() (ties
+            // to even), s0 floored at 0. The s1 clamp needs T_lat, done below.
+            inp_s0 = @intFromFloat(@max(0.0, roundEven(@as(f64, r.start) * 44100.0 / 4096.0)));
+            inp_s1 = @intFromFloat(@max(0.0, roundEven(@as(f64, r.end) * 44100.0 / 4096.0)));
+        }
         // audio-to-audio σmax floor (sa3_mlx.py:538-542 MIN_SIGMA) — checked
         // unconditionally like the reference, even without init_audio (below
         // the floor the rf_denoiser is undefined at t≈0 and emits NaN).
@@ -3205,6 +3337,13 @@ pub const Engine = struct {
         // T_lat = ceil(seconds * 44100 / 4096) — decoder-independent
         const t_lat_raw: usize = @intFromFloat(@ceil(seconds * 44100.0 / 4096.0));
         const t_lat: usize = @max(1, t_lat_raw);
+        if (req.inpaint_range != null) {
+            inp_s1 = @min(t_lat, inp_s1);
+            // both bounds may round onto the same latent (a range narrower
+            // than one 93 ms latent regenerates nothing). Fail loud rather
+            // than hand back the untouched init audio.
+            if (inp_s0 >= inp_s1) return error.InvalidInpaintRange;
+        }
 
         // initial noise: mx.random.normal((1,256,T_lat), f16, key(seed))
         if (progress) |p| p.emit("sample", 0, @intCast(steps));
@@ -3224,14 +3363,34 @@ pub const Engine = struct {
         // mix noise = init*(1−σ) + x0*σ. x0's defer above frees whatever
         // ends up bound; the original handle is released here before the
         // reassignment (handles are owners, not shared refs).
+        var inpaint_state: ?Inpaint = null;
+        defer if (inpaint_state) |ip| {
+            _ = mlx.mlx_array_free(ip.local);
+            _ = mlx.mlx_array_free(ip.mask);
+            _ = mlx.mlx_array_free(ip.init);
+        };
         if (req.init_audio) |pcm| {
             const init = try self.enc.encode(allocator, pcm, @intCast(t_lat), null, self.s);
             defer _ = mlx.mlx_array_free(init);
             const init16 = try astype(init, .float16, self.s);
-            defer _ = mlx.mlx_array_free(init16);
-            const mixed = try mixInitNoise(init16, x0, sigma_max, self.s);
-            _ = mlx.mlx_array_free(x0);
-            x0 = mixed;
+            if (req.inpaint_range != null) {
+                // inpaint mode: NO init mix (sa3_mlx.py:702 — the guard is
+                // `init_latents is not None and inpaint_range is None`), x0
+                // stays the pure seeded noise. The init instead becomes the
+                // mask's operand: local_add_cond for the DiT and the
+                // paste-back targets for the final latent.
+                errdefer _ = mlx.mlx_array_free(init16);
+                const inp_mask = try buildInpaintMask(allocator, t_lat, inp_s0, inp_s1);
+                errdefer _ = mlx.mlx_array_free(inp_mask);
+                const local = try buildInpaintLocalCond(init16, inp_mask, self.s);
+                errdefer _ = mlx.mlx_array_free(local);
+                inpaint_state = .{ .local = local, .init = init16, .mask = inp_mask };
+            } else {
+                defer _ = mlx.mlx_array_free(init16);
+                const mixed = try mixInitNoise(init16, x0, sigma_max, self.s);
+                _ = mlx.mlx_array_free(x0);
+                x0 = mixed;
+            }
         }
 
         // redraws: (key, sub) = split(key); draw sub at every step with
@@ -3307,7 +3466,7 @@ pub const Engine = struct {
             guidance = .{ .cfg = req.cfg_scale, .apg = apg, .null_cross = nc };
         }
 
-        const lats = try samplePingPong(allocator, &self.dit, x0, sigmas, noises, cond.cross, cond.global_cond, guidance, progress, self.s);
+        const lats = try samplePingPong(allocator, &self.dit, x0, sigmas, noises, cond.cross, cond.global_cond, guidance, inpaint_state, progress, self.s);
         defer {
             for (lats) |l| _ = mlx.mlx_array_free(l);
             allocator.free(lats);
@@ -3702,4 +3861,212 @@ test "stable_audio3: audio-to-audio refuses σmax below MIN_SIGMA and non-stereo
         .seed = 1,
         .init_audio = bad,
     }, null));
+}
+
+// ── stage 4: inpainting ─────────────────────────────────────────────────────
+//
+// sa3_mlx.py --init-audio + --inpaint-range START,END: the mask keeps the
+// init audio outside the range and regenerates inside it. Two things separate
+// this from audio-to-audio:
+//   1. the init is NEVER mixed into the noise — the sampler starts from the
+//      same pure x0 as text-to-audio (sa3_mlx.py:702),
+//   2. the DiT conditions on a [1, T_lat, 257] local_add_cond of
+//      (mask, masked_init), and the kept region is pasted back over the
+//      FINAL latent when sampling ends (sa3_pipeline.py:147-151).
+
+/// meta.inpaint of the fixture dump: --inpaint-range 4.0,9.0 on the 15 s run.
+const INPAINT_T_LAT: usize = 162;
+const INPAINT_LATENTS = [_]usize{ 43, 97 };
+
+test "stable_audio3 oracle: inpainting mask + local_add_cond match reference" {
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const fix = try fixturesDir();
+    const st = mlx.gpuStream();
+
+    const mask_ref = try readRawF32(io, a, fix, "inpaint_mask.f32.raw");
+    defer a.free(mask_ref);
+    const init_ref = try readRawF32(io, a, fix, "init_latents_trim.f32.raw");
+    defer a.free(init_ref);
+    const lac_ref = try readRawF32(io, a, fix, "inpaint_local_cond.f32.raw");
+    defer a.free(lac_ref);
+    try testing.expectEqual(@as(usize, INPAINT_T_LAT), mask_ref.len);
+
+    const mask = try buildInpaintMask(a, INPAINT_T_LAT, INPAINT_LATENTS[0], INPAINT_LATENTS[1]);
+    defer _ = mlx.mlx_array_free(mask);
+    try assertParity(mask, mask_ref, "inpaint mask", 0.9999, 0.001, st);
+
+    // the fixture latents are f32 storage of f16 values — round-trip is exact.
+    const init = mlx.mlx_array_new_data(init_ref.ptr, &[_]c_int{ 1, 256, @intCast(INPAINT_T_LAT) }, 3, .float32);
+    defer _ = mlx.mlx_array_free(init);
+    const init16 = try astype(init, .float16, st);
+    defer _ = mlx.mlx_array_free(init16);
+
+    const lac = try buildInpaintLocalCond(init16, mask, st);
+    defer _ = mlx.mlx_array_free(lac);
+    try assertParity(lac, lac_ref, "inpaint local_add_cond", 0.9999, 0.001, st);
+}
+
+test "stable_audio3 oracle: inpainting DiT taps match reference (plain + CFG batch)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const dir = try sa3ModelDir();
+    const fix = try fixturesDir();
+    const st = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(st);
+
+    const x0_raw = try readRawF32(io, a, fix, "x0.f32.raw");
+    defer a.free(x0_raw);
+    const cross_raw = try readRawF32(io, a, fix, "cross_attn.f32.raw");
+    defer a.free(cross_raw);
+    const neg_raw = try readRawF32(io, a, fix, "cross_attn_neg.f32.raw");
+    defer a.free(neg_raw);
+    const glob_raw = try readRawF32(io, a, fix, "global_cond.f32.raw");
+    defer a.free(glob_raw);
+    const init_ref = try readRawF32(io, a, fix, "init_latents_trim.f32.raw");
+    defer a.free(init_ref);
+    const mask_ref = try readRawF32(io, a, fix, "inpaint_mask.f32.raw");
+    defer a.free(mask_ref);
+
+    var dit = try Dit.load(io, a, dir);
+    defer dit.deinit();
+
+    const T: usize = @intCast(x0_raw.len / 256);
+    try testing.expectEqual(INPAINT_T_LAT, T);
+    const x0_32 = mlx.mlx_array_new_data(x0_raw.ptr, &[_]c_int{ 1, 256, @intCast(T) }, 3, .float32);
+    defer _ = mlx.mlx_array_free(x0_32);
+    const x0 = try astype(x0_32, .float16, st);
+    defer _ = mlx.mlx_array_free(x0);
+    const cross_32 = mlx.mlx_array_new_data(cross_raw.ptr, &[_]c_int{ 1, 257, 768 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(cross_32);
+    const cross = try astype(cross_32, .float16, st);
+    defer _ = mlx.mlx_array_free(cross);
+    const neg_32 = mlx.mlx_array_new_data(neg_raw.ptr, &[_]c_int{ 1, 257, 768 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(neg_32);
+    const cross_neg = try astype(neg_32, .float16, st);
+    defer _ = mlx.mlx_array_free(cross_neg);
+    const glob_32 = mlx.mlx_array_new_data(glob_raw.ptr, &[_]c_int{ 1, 768 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(glob_32);
+    const glob = try astype(glob_32, .float16, st);
+    defer _ = mlx.mlx_array_free(glob);
+
+    const mask = try buildInpaintMask(a, T, INPAINT_LATENTS[0], INPAINT_LATENTS[1]);
+    defer _ = mlx.mlx_array_free(mask);
+    const init_32 = mlx.mlx_array_new_data(init_ref.ptr, &[_]c_int{ 1, 256, @intCast(T) }, 3, .float32);
+    defer _ = mlx.mlx_array_free(init_32);
+    const init16 = try astype(init_32, .float16, st);
+    defer _ = mlx.mlx_array_free(init16);
+    const lac = try buildInpaintLocalCond(init16, mask, st);
+    defer _ = mlx.mlx_array_free(lac);
+
+    // plain forward: the local embedding path on its own (no sampler noise).
+    const tv: f32 = 0.5;
+    const t_arr = mlx.mlx_array_new_data(&tv, &[_]c_int{1}, 1, .float32);
+    defer _ = mlx.mlx_array_free(t_arr);
+    const v = try dit.forward(a, x0, t_arr, cross, glob, lac, st);
+    defer _ = mlx.mlx_array_free(v);
+    const v_ref = try readRawF32(io, a, fix, "inpaint_v_t50.f32.raw");
+    defer a.free(v_ref);
+    try assertParity(v, v_ref, "inpaint v t50", 0.999, 0.01, st);
+
+    // CFG batch: local_add_cond must be duplicated across cond/uncond.
+    const cv = try cfgVelocity(a, &dit, x0, t_arr, cross, glob, .{
+        .cfg = 3.0,
+        .apg = 1.0,
+        .null_cross = cross_neg,
+    }, lac, st);
+    defer _ = mlx.mlx_array_free(cv);
+    const cv_ref = try readRawF32(io, a, fix, "inpaint_cfg_v_t50.f32.raw");
+    defer a.free(cv_ref);
+    try assertParity(cv, cv_ref, "inpaint cfg v t50", 0.999, 0.01, st);
+}
+
+test "stable_audio3 oracle: inpainting end-to-end matches reference audio" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const dir = try sa3ModelDir();
+    const fix = try fixturesDir();
+    const st = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(st);
+
+    var eng = try Engine.load(io, a, dir);
+    defer eng.deinit();
+    // same dequantize-for-test rule as the plain e2e (fixtures = dequantized pack).
+    try dequantizeForTest(&eng.t5.w, st);
+    try dequantizeForTest(&eng.dit.w, st);
+
+    const pcm_raw = try readRawF32(io, a, fix, "init_pcm_trim.f32.raw");
+    defer a.free(pcm_raw);
+    const pcm = mlx.mlx_array_new_data(pcm_raw.ptr, &[_]c_int{ 1, 2, @intCast(pcm_raw.len / 2) }, 3, .float32);
+    defer _ = mlx.mlx_array_free(pcm);
+
+    const out = try eng.generate(a, .{
+        .prompt = "A beautiful piano arpeggio grows into a cinematic climax",
+        .seconds = 15.0,
+        .steps = 8,
+        .seed = 1234,
+        .init_audio = pcm,
+        // dump_stable_audio3_fixtures.INPAINT_RANGE_SEC — must stay in sync.
+        .inpaint_range = .{ .start = 4.0, .end = 9.0 },
+    }, null);
+    defer a.free(out.samples);
+
+    const ref = try readRawF32(io, a, fix, "audio_inpaint.f32.raw");
+    defer a.free(ref);
+    const want: usize = 661500; // 15 s * 44100, same trim the reference applies
+    try testing.expectEqual(@as(usize, want * 2), out.samples.len);
+
+    const sh = [_]c_int{ 1, 2, @intCast(want) };
+    const arr = mlx.mlx_array_new_data(out.samples.ptr, &sh, 3, .float32);
+    defer _ = mlx.mlx_array_free(arr);
+    try assertParity(arr, ref, "e2e inpaint audio", 0.99, 0.05, st);
+}
+
+test "stable_audio3: inpainting refuses a missing init and an out-of-track range" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const dir = try sa3ModelDir();
+    var eng = try Engine.load(io, a, dir);
+    defer eng.deinit();
+
+    // the reference exits: "--inpaint-range requires --init-audio"
+    try testing.expectError(error.InpaintRequiresInit, eng.generate(a, .{
+        .prompt = "x",
+        .seconds = 15.0,
+        .steps = 8,
+        .seed = 1,
+        .inpaint_range = .{ .start = 4.0, .end = 9.0 },
+    }, null));
+
+    // "0 <= start < end <= seconds" (sa3_mlx.py:524) — needs an init present,
+    // since the reference checks that first (so does the engine above).
+    const zbuf = try a.alloc(f32, 8192);
+    defer a.free(zbuf);
+    @memset(zbuf, 0);
+    const init_pcm = mlx.mlx_array_new_data(zbuf.ptr, &[_]c_int{ 1, 2, 4096 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(init_pcm);
+
+    const bad = [_]InpaintRange{
+        .{ .start = -0.5, .end = 9.0 },
+        .{ .start = 9.0, .end = 4.0 },
+        .{ .start = 4.0, .end = 4.0 },
+        .{ .start = 0.0, .end = 16.0 },
+        .{ .start = std.math.nan(f32), .end = 9.0 },
+        // narrower than one 4096-sample latent — both bounds round onto the
+        // same latent, so nothing would be regenerated.
+        .{ .start = 4.0, .end = 4.001 },
+    };
+    for (bad) |r| {
+        try testing.expectError(error.InvalidInpaintRange, eng.generate(a, .{
+            .prompt = "x",
+            .seconds = 15.0,
+            .steps = 8,
+            .seed = 1,
+            .init_audio = init_pcm,
+            .inpaint_range = r,
+        }, null));
+    }
 }
