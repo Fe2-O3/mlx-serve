@@ -6,7 +6,8 @@
 # fields refused BY NAME, guidance type/range/pairing refusals, audio-to-audio
 # σmax floor + payload refusals, TTS endpoint mismatch) -> a guidance
 # generation (cfg_scale + negative_prompt + apg) -> an audio-to-audio
-# generation (init_audio + init_noise_level) -> SSE streaming with
+# generation (init_audio + init_noise_level) -> inpainting pairing/range
+# refusals + an inpainting generation (init_audio + inpaint_range) -> SSE streaming with
 # condition/sample progress + base64 complete -> chat coexistence -> unload.
 # Proves the third music backend routes end to end.
 #
@@ -120,6 +121,22 @@ grep -q "init_audio" /tmp/test_stable_audio3_err.txt || { echo "FAIL: init_audio
 b400 "init_audio bad base64" "{\"model\":\"$SA3_ID\",\"prompt\":\"jazz\",\"init_audio\":\"not base64!!\"}"
 grep -q "init_audio" /tmp/test_stable_audio3_err.txt || { echo "FAIL: bad-base64 400 does not name init_audio"; cat /tmp/test_stable_audio3_err.txt; exit 1; }
 b400 "init_audio not a WAV" "{\"model\":\"$SA3_ID\",\"prompt\":\"jazz\",\"init_audio\":\"$(printf 'not a wave file padded out' | base64)\"}"
+# Stage-4 inpainting: a range operates ON init_audio, so every way to get the
+# pairing or the numbers wrong is a 400 that NAMES the field.
+b400 "inpaint_range without init_audio" "{\"model\":\"$SA3_ID\",\"prompt\":\"jazz\",\"inpaint_range\":[0.5,2.0]}"
+grep -q "inpaint_range" /tmp/test_stable_audio3_err.txt || { echo "FAIL: inpaint-without-init 400 does not name inpaint_range"; cat /tmp/test_stable_audio3_err.txt; exit 1; }
+grep -q "init_audio" /tmp/test_stable_audio3_err.txt || { echo "FAIL: inpaint-without-init 400 does not point at init_audio"; cat /tmp/test_stable_audio3_err.txt; exit 1; }
+b400 "inpaint_range single number" "{\"model\":\"$SA3_ID\",\"prompt\":\"jazz\",\"inpaint_range\":[1.0]}"
+grep -q "inpaint_range" /tmp/test_stable_audio3_err.txt || { echo "FAIL: one-number range 400 does not name inpaint_range"; cat /tmp/test_stable_audio3_err.txt; exit 1; }
+b400 "inpaint_range three numbers" "{\"model\":\"$SA3_ID\",\"prompt\":\"jazz\",\"inpaint_range\":[0,1,2]}"
+b400 "inpaint_range non-numeric" "{\"model\":\"$SA3_ID\",\"prompt\":\"jazz\",\"inpaint_range\":\"later\"}"
+b400 "inpaint_range not a list" "{\"model\":\"$SA3_ID\",\"prompt\":\"jazz\",\"inpaint_range\":42}"
+# the range checks run ahead of the WAV decode, so a placeholder init_audio
+# is enough to reach them (no real WAV needed for a logic error).
+b400 "inpaint_range start >= end" "{\"model\":\"$SA3_ID\",\"prompt\":\"jazz\",\"init_audio\":\"AAAA\",\"inpaint_range\":[2.0,0.5]}"
+grep -q "duration_seconds" /tmp/test_stable_audio3_err.txt || { echo "FAIL: inverted range 400 does not state the constraint"; cat /tmp/test_stable_audio3_err.txt; exit 1; }
+b400 "inpaint_range end past duration" "{\"model\":\"$SA3_ID\",\"prompt\":\"jazz\",\"init_audio\":\"AAAA\",\"duration_seconds\":4,\"inpaint_range\":[0.5,9.0]}"
+b400 "inpaint_range negative start" "{\"model\":\"$SA3_ID\",\"prompt\":\"jazz\",\"init_audio\":\"AAAA\",\"inpaint_range\":[-1.0,2.0]}"
 # The TTS endpoint against a music model is an explicit 400.
 code=$(api /v1/audio/speech -X POST -H 'Content-Type: application/json' \
   -d "{\"model\":\"$SA3_ID\",\"input\":\"hello\"}" -o /dev/null -w "%{http_code}")
@@ -181,6 +198,27 @@ wav_ok /tmp/test_stable_audio3_a2a.wav "audio-to-audio gen" 0.5 4.5
 grep -q '\[sa3\] init audio' /tmp/test_stable_audio3_server.log || { echo "FAIL: no [sa3] init audio in log"; exit 1; }
 grep -q '\[sa3\] generating .*smax=0.5' /tmp/test_stable_audio3_server.log || { echo "FAIL: a2a generation did not log smax=0.5"; exit 1; }
 echo "PASS: audio-to-audio gen (init_audio + σmax 0.5) -> WAV, init + smax logged"
+
+# 3d. Inpainting: keep the audio outside [0.5,2.0]s, regenerate inside it.
+# Same init WAV as 3c — the log must show the range was taken, not dropped.
+python3 - "$SA3_ID" <<'PYEOF' > /tmp/test_stable_audio3_inpaint_req.json
+import json, sys
+print(json.dumps({
+    "model": sys.argv[1],
+    "prompt": "a gentle piano arpeggio",
+    "duration_seconds": 4, "steps": 8, "seed": 7,
+    "init_audio": open("/tmp/test_stable_audio3_init.b64").read(),
+    "inpaint_range": [0.5, 2.0],
+}))
+PYEOF
+code=$(api /v1/audio/music-generations -X POST -H 'Content-Type: application/json' \
+  -d @/tmp/test_stable_audio3_inpaint_req.json -o /tmp/test_stable_audio3_inpaint.wav -w "%{http_code}")
+[ "$code" = "200" ] || { echo "FAIL: inpaint music gen http $code"; head -c 300 /tmp/test_stable_audio3_inpaint.wav; tail -20 /tmp/test_stable_audio3_server.log; exit 1; }
+wav_ok /tmp/test_stable_audio3_inpaint.wav "inpainting gen" 0.5 4.5
+grep -q '\[sa3\] init audio' /tmp/test_stable_audio3_server.log || { echo "FAIL: inpainting dropped the init audio"; exit 1; }
+grep -q '\[sa3\] generating .*inpaint=\[0.50..2.00\]' /tmp/test_stable_audio3_server.log \
+  || { echo "FAIL: inpainting generation did not log inpaint=[0.50..2.00]"; exit 1; }
+echo "PASS: inpainting gen (init_audio + inpaint_range) -> WAV, range logged"
 
 # 4. Server survives the gen.
 curl -sf "http://127.0.0.1:$PORT/health" >/dev/null || { echo "FAIL: server died after music gen"; exit 1; }

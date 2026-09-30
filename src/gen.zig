@@ -3028,6 +3028,30 @@ fn handleMusicSa3(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, s
     defer if (init_audio) |r| {
         _ = mlx.mlx_array_free(r);
     };
+    // stage 4: inpainting — parse here (needs nothing but the body); the
+    // cross-field checks wait for `init_audio` + `duration` below.
+    const inp = sa3InpaintFromJson(body);
+    if (inp.err) |m| return sendError(conn, 400, m);
+
+    const duration: u32 = @intCast(extractJsonInt(body, "duration_seconds") orelse 30);
+    if (duration < stable_audio3.MIN_DURATION_S or duration > stable_audio3.MAX_DURATION_S)
+        return sendError(conn, 400, "'duration_seconds' must be in [1,384]");
+    const steps: u32 = @intCast(extractJsonInt(body, "steps") orelse stable_audio3.DEFAULT_STEPS);
+    if (steps < 1 or steps > stable_audio3.MAX_STEPS) return sendError(conn, 400, "'steps' must be in [1,100]");
+    const seed: u64 = extractJsonInt(body, "seed") orelse 42;
+
+    // stage 4 cross-checks (sa3_mlx.py:519-528): inpainting operates ON the
+    // init audio, so a range without it has nothing to keep, and the range
+    // must sit inside the track. Checked against the RAW field — ahead of the
+    // WAV decode, so a bad range is named before a bad payload is decoded.
+    if (inp.range) |r| {
+        if (a2a.init_audio_raw == null)
+            return sendError(conn, 400, "'inpaint_range' needs a non-empty 'init_audio' — the base64 WAV being inpainted into");
+        const dur_s: f32 = @floatFromInt(duration);
+        if (!(r.start >= 0.0 and r.start < r.end and r.end <= dur_s))
+            return sendError(conn, 400, "'inpaint_range' must satisfy 0 <= start < end <= duration_seconds (seconds, not samples)");
+    }
+
     if (a2a.init_audio_raw) |raw| {
         const b64 = try jsonUnescape(allocator, raw);
         defer allocator.free(b64);
@@ -3051,22 +3075,26 @@ fn handleMusicSa3(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, s
         }
         const nsh = [3]c_int{ 1, 2, @intCast(n) };
         init_audio = mlx.mlx_array_new_data(planar.ptr, &nsh, 3, .float32);
-        log.info("[sa3] init audio: {d:.1}s {d} Hz {d}ch -> audio-to-audio\n", .{
+        log.info("[sa3] init audio: {d:.1}s {d} Hz {d}ch -> {s}\n", .{
             @as(f32, @floatFromInt(n)) / @as(f32, @floatFromInt(stable_audio3.SAMPLE_RATE)),
             dec.sample_rate,
             dec.channels,
+            if (inp.range != null) "inpainting" else "audio-to-audio",
         });
     }
 
-    const duration: u32 = @intCast(extractJsonInt(body, "duration_seconds") orelse 30);
-    if (duration < stable_audio3.MIN_DURATION_S or duration > stable_audio3.MAX_DURATION_S)
-        return sendError(conn, 400, "'duration_seconds' must be in [1,384]");
-    const steps: u32 = @intCast(extractJsonInt(body, "steps") orelse stable_audio3.DEFAULT_STEPS);
-    if (steps < 1 or steps > stable_audio3.MAX_STEPS) return sendError(conn, 400, "'steps' must be in [1,100]");
-    const seed: u64 = extractJsonInt(body, "seed") orelse 42;
-
     const want_stream = sse.bodyWantsTrue(body, "stream");
-    log.info("[sa3] generating {d}s steps={d} seed={d} cfg={d} smax={d:.2} init_audio={} stream={}\n", .{ duration, steps, seed, g.cfg_scale, a2a.init_noise_level, init_audio != null, want_stream });
+    log.info("[sa3] generating {d}s steps={d} seed={d} cfg={d} smax={d:.2} init_audio={} inpaint=[{d:.2}..{d:.2}] stream={}\n", .{
+        duration,
+        steps,
+        seed,
+        g.cfg_scale,
+        a2a.init_noise_level,
+        init_audio != null,
+        if (inp.range) |r| r.start else 0.0,
+        if (inp.range) |r| r.end else 0.0,
+        want_stream,
+    });
     var sctx = sse.StreamCtx{ .conn = conn, .stream = want_stream };
     const prog: ?sse.Progress = sctx.progress();
     if (want_stream) try conn.writeAll(sse.headers);
@@ -3081,6 +3109,7 @@ fn handleMusicSa3(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, s
         .apg = g.apg,
         .init_audio = init_audio,
         .init_noise_level = a2a.init_noise_level,
+        .inpaint_range = inp.range,
     };
     const wav = sa.generateWav(allocator, req, prog) catch |err| {
         if (err == error.Cancelled) {
@@ -3217,12 +3246,47 @@ fn sa3A2aFromJson(body: []const u8) Sa3A2a {
 /// Stable Audio 3 path, from the ACE-Step / MiniMax Music 3 handlers:
 /// those engines cover with `src_audio` + `task`, and silently dropping
 /// init_audio would hand back audio that ignored what was asked for.
-const a2a_only_field_msg = "'init_audio' / 'init_noise_level' are Stable Audio 3 fields — on this engine cover a track with 'src_audio' + 'task' instead";
+const a2a_only_field_msg = "'init_audio' / 'init_noise_level' / 'inpaint_range' are Stable Audio 3 fields — on this engine cover a track with 'src_audio' + 'task' instead";
 
 fn a2aFieldRefusal(body: []const u8) ?[]const u8 {
     if (jsonHasKey(body, "init_audio")) return a2a_only_field_msg;
     if (jsonHasKey(body, "init_noise_level")) return a2a_only_field_msg;
+    if (jsonHasKey(body, "inpaint_range")) return a2a_only_field_msg;
     return null;
+}
+
+/// Parsed Stable Audio 3 inpainting field (stage 4). `err` non-null → HTTP
+/// 400 message (static); `range` is the requested (start, end) in seconds.
+const Sa3Inpaint = struct {
+    range: ?stable_audio3.InpaintRange = null,
+    err: ?[]const u8 = null,
+};
+
+const inpaint_range_err = "'inpaint_range' must be exactly two numbers, [start, end] in seconds (e.g. [4.0, 9.0])";
+
+/// Inpainting field of an SA3 music body (reference sa3_mlx.py
+/// `--inpaint-range START,END`): `[start, end]` in seconds, or the same two
+/// numbers as a string — the spelling `extractFloatArrayField` already gives
+/// `cond_weights` and `lora_scales`. A malformed range is named, never
+/// dropped, same contract as the guidance / a2a fields. The cross-field
+/// checks (needs init_audio; 0 <= start < end <= duration_seconds) live in
+/// handleMusicSa3, where `init_audio` and `duration` are known.
+fn sa3InpaintFromJson(body: []const u8) Sa3Inpaint {
+    var g: Sa3Inpaint = .{};
+    if (!jsonHasKey(body, "inpaint_range")) return g;
+    var buf: [2]f32 = undefined;
+    const got = extractFloatArrayField(body, "inpaint_range", &buf) orelse {
+        g.err = inpaint_range_err;
+        return g;
+    };
+    // one number, or three+ (parseFloatList refuses to overrun `buf`) —
+    // either way this is not a range.
+    if (got.len != 2) {
+        g.err = inpaint_range_err;
+        return g;
+    }
+    g.range = .{ .start = got[0], .end = got[1] };
+    return g;
 }
 
 /// POST /v1/video/generations — base64 RGB8 frames (or SSE progress + complete).
@@ -6482,6 +6546,48 @@ test "sa3A2aFromJson + a2aFieldRefusal: audio-to-audio parse, σmax floor, engin
     try testing.expect(a2aFieldRefusal("{\"prompt\":\"x\",\"init_noise_level\":0.5}") != null);
     try testing.expect(a2aFieldRefusal("{\"prompt\":\"x\",\"cfg_scale\":3}") == null);
     try testing.expect(a2aFieldRefusal("{\"prompt\":\"x\",\"src_audio\":\"AAA=\"}") == null);
+}
+
+test "sa3InpaintFromJson: inpaint range parses, and cross-engine refuses it" {
+    // absent → null, no error (plain text-to-audio / a2a unaffected).
+    const d = sa3InpaintFromJson("{\"prompt\":\"rain\"}");
+    try testing.expect(d.err == null);
+    try testing.expect(d.range == null);
+
+    // the reference form: two seconds, [start, end].
+    const ok = sa3InpaintFromJson("{\"prompt\":\"rain\",\"inpaint_range\":[4.0,9.0]}");
+    try testing.expect(ok.err == null);
+    try testing.expectEqual(@as(f32, 4.0), ok.range.?.start);
+    try testing.expectEqual(@as(f32, 9.0), ok.range.?.end);
+
+    // …and the CLI's "START,END" string spelling, which the other float-list
+    // fields already accept.
+    const str = sa3InpaintFromJson("{\"prompt\":\"rain\",\"inpaint_range\":\"4.0,9.0\"}");
+    try testing.expect(str.err == null);
+    try testing.expectEqual(@as(f32, 9.0), str.range.?.end);
+
+    // fail loud, never a silent default: wrong count, wrong type, non-finite.
+    const one = sa3InpaintFromJson("{\"prompt\":\"rain\",\"inpaint_range\":[4.0]}");
+    try testing.expect(one.err != null);
+    const three = sa3InpaintFromJson("{\"prompt\":\"rain\",\"inpaint_range\":[1,4,9]}");
+    try testing.expect(three.err != null);
+    const txt = sa3InpaintFromJson("{\"prompt\":\"rain\",\"inpaint_range\":\"later\"}");
+    try testing.expect(txt.err != null);
+    const num = sa3InpaintFromJson("{\"prompt\":\"rain\",\"inpaint_range\":42}");
+    try testing.expect(num.err != null);
+    const big = sa3InpaintFromJson("{\"prompt\":\"rain\",\"inpaint_range\":[0,1e400]}");
+    try testing.expect(big.err != null);
+    const nan = sa3InpaintFromJson("{\"prompt\":\"rain\",\"inpaint_range\":[0,null]}");
+    try testing.expect(nan.err != null);
+
+    // the message names the field, same contract as cfg_scale / init_audio.
+    try testing.expect(std.mem.indexOf(u8, one.err.?, "inpaint_range") != null);
+
+    // on ACE-Step / MiniMax inpainting refuses by name too — a silently
+    // dropped range would hand back audio that ignored what was asked for.
+    try testing.expect(a2aFieldRefusal("{\"prompt\":\"x\",\"inpaint_range\":[1,4]}") != null);
+    try testing.expect(a2aFieldRefusal("{\"prompt\":\"x\",\"init_audio\":\"AAA=\"}") != null);
+    try testing.expect(a2aFieldRefusal("{\"prompt\":\"x\",\"cfg_scale\":3}") == null);
 }
 
 test "videoRgbTransportReason: chained windows are billed into the response cap (#283)" {
